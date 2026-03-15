@@ -1,0 +1,10 @@
+{
+  "name": "multi-cli-session-dashboard",
+  "version": "0.1.0",
+  "description": "Self-hosted dashboard for browsing and continuing local Claude, Codex, and Copilot CLI sessions",
+  "type": "module",
+  "scripts": {
+    "start": "node server.js",
+    "check": "node --check server.js && node --check interaction.js && node --check config.js && node --check public/js/app.js && node --check public/js/components/sidebar.js && node --check public/js/components/session-list.js && node --check public/js/components/chat-view.js && node --check public/js/components/composer.js"
+  }
+}

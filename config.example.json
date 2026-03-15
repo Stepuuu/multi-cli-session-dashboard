@@ -1,0 +1,12 @@
+{
+  "port": 3456,
+  "workspaceRoot": "/path/to/your/workspace",
+  "claudeProjectsDir": "/home/your-user/.claude/projects",
+  "codexSessionsDir": "/home/your-user/.codex/sessions",
+  "copilotSessionStateDir": "/home/your-user/.copilot/session-state",
+  "codexBin": "codex",
+  "claudeBin": "claude",
+  "copilotBin": "copilot",
+  "copilotConfigDir": "/home/your-user/.copilot",
+  "copilotConfigFile": "/home/your-user/.copilot/config.json"
+}

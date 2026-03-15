@@ -1,0 +1,77 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Session Dashboard</title>
+  <link rel="stylesheet" href="css/reset.css">
+  <link rel="stylesheet" href="css/theme.css">
+  <link rel="stylesheet" href="css/layout.css">
+  <link rel="stylesheet" href="css/components.css">
+</head>
+<body>
+  <div class="app">
+    <header class="status-bar">
+      <div class="status-left">
+        <span class="logo">SESSION DASHBOARD</span>
+      </div>
+      <div class="status-right">
+        <span class="status-item" id="status-info">Loading...</span>
+      </div>
+    </header>
+
+    <main class="panels">
+      <aside id="sidebar" class="panel">
+        <div class="panel-header">PROJECTS</div>
+        <div id="project-list">
+          <div class="empty-state">Loading projects...</div>
+        </div>
+      </aside>
+
+      <section id="session-panel" class="panel">
+        <div class="panel-header session-panel-header">
+          <span>SESSIONS</span>
+          <div id="session-actions" class="session-actions"></div>
+        </div>
+        <div id="session-list">
+          <div class="empty-state">Select a project to begin</div>
+        </div>
+      </section>
+
+      <section id="chat-panel" class="panel">
+        <div class="chat-header" id="chat-header">Select a session</div>
+        <div id="chat-messages" class="chat-messages">
+          <div class="empty-state">
+            <div class="empty-state-icon">_</div>
+            Select a project and session to view Claude, Codex, or Copilot history
+          </div>
+        </div>
+        <div class="composer-shell" id="composer-shell">
+          <div class="composer-meta" id="composer-meta">Select a session to start interacting.</div>
+          <div class="composer-attachments" id="composer-attachments"></div>
+          <textarea
+            id="composer-input"
+            class="composer-input"
+            placeholder="Type a message for the selected session..."
+            rows="4"
+            disabled
+          ></textarea>
+          <input id="composer-image-input" class="composer-image-input" type="file" accept="image/*" multiple hidden>
+          <div class="composer-actions">
+            <button id="composer-upload" class="composer-btn composer-btn-secondary" disabled>Add Images</button>
+            <span id="composer-status" class="composer-status">Idle</span>
+            <button id="composer-send" class="composer-btn composer-btn-primary" disabled>Send</button>
+          </div>
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <!-- Components loaded first (they define functions used by app.js) -->
+  <script src="js/components/sidebar.js"></script>
+  <script src="js/components/session-list.js"></script>
+  <script src="js/components/chat-view.js"></script>
+  <script src="js/components/composer.js"></script>
+  <script src="js/app.js"></script>
+</body>
+</html>
