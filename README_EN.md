@@ -144,6 +144,37 @@ This makes browser-side image input practical even when the real tool is running
 - Add export / archive support
 - Add search across sessions
 
+## Contributing
+
+Issues, feature requests, and pull requests are welcome.
+
+If you want to improve the dashboard, support another CLI, or refine the browser-side interaction workflow, please open an issue or submit a PR:
+
+- Issues: <https://github.com/Stepuuu/multi-cli-session-dashboard/issues>
+- Pull Requests: <https://github.com/Stepuuu/multi-cli-session-dashboard/pulls>
+
+Suggested contribution areas:
+
+- support for additional AI CLIs
+- authentication and multi-user deployment
+- search and indexing improvements
+- richer rendering for tool events and artifacts
+- better export / archive workflows
+
+## Citation
+
+If this project helps your workflow, research, or internal tooling, please cite it:
+
+```bibtex
+@misc{multi-cli-session-dashboard,
+  author       = {Stepuuu},
+  title        = {CLI Session Dashboard: A Self-hosted Dashboard for Browsing and Continuing Local AI CLI Sessions},
+  year         = {2026},
+  publisher    = {GitHub},
+  howpublished = {\url{https://github.com/Stepuuu/multi-cli-session-dashboard}},
+}
+```
+
 ## License
 
 MIT

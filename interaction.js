@@ -183,6 +183,10 @@ async function materializeImages(images) {
   return { dir: uploadDir, files };
 }
 
+function imageCountText(count) {
+  return `${count} image${count === 1 ? '' : 's'}`;
+}
+
 function buildPrompt(text, imageFiles, directImages) {
   const trimmed = typeof text === 'string' ? text.trim() : '';
   let prompt = trimmed;
@@ -465,6 +469,31 @@ export async function handleInteractionRequest(req, res, { project, locator, con
     const preferredCwd = defaultCwd(locator, config);
     const cwd = (await pathExists(preferredCwd)) ? preferredCwd : config.workspaceRoot;
 
+    if (images.length > 0) {
+      sendEvent(res, {
+        type: 'image_state',
+        selectedCount: images.length,
+        decodedCount: imageFiles.length,
+        transport: imageFiles.length > 0 ? 'prepared' : 'failed',
+      });
+    }
+
+    if (images.length > 0 && imageFiles.length === 0) {
+      sendEvent(res, {
+        type: 'error',
+        message: 'Image upload failed before reaching the backend. No valid image payload was decoded.',
+      });
+      res.end();
+      return;
+    }
+
+    if (imageFiles.length > 0 && imageFiles.length < images.length) {
+      sendEvent(res, {
+        type: 'status',
+        message: `Only ${imageCountText(imageFiles.length)} could be decoded from ${images.length} uploaded item(s).`,
+      });
+    }
+
     if (project.projectPath !== locator.projectPath) {
       sendEvent(res, { type: 'error', message: 'Session does not belong to the selected project.' });
       res.end();
@@ -475,6 +504,18 @@ export async function handleInteractionRequest(req, res, { project, locator, con
       const prompt = buildPrompt(text, imageFiles, true);
       const args = createCodexArgs(locator, prompt, imageFiles);
       sendEvent(res, { type: 'status', message: 'Starting Codex interaction...' });
+      if (imageFiles.length > 0) {
+        sendEvent(res, {
+          type: 'image_state',
+          selectedCount: images.length,
+          decodedCount: imageFiles.length,
+          transport: 'native',
+        });
+        sendEvent(res, {
+          type: 'status',
+          message: `Attached ${imageCountText(imageFiles.length)} to the Codex request.`,
+        });
+      }
       await streamProcess(res, req, config.codexBin, args, {
         cwd,
         parseLine: parseCodexLine,
@@ -486,6 +527,18 @@ export async function handleInteractionRequest(req, res, { project, locator, con
       const prompt = buildPrompt(text, imageFiles, false);
       const args = createClaudeArgs(locator, prompt, uploadDir);
       sendEvent(res, { type: 'status', message: 'Starting Claude interaction...' });
+      if (imageFiles.length > 0) {
+        sendEvent(res, {
+          type: 'image_state',
+          selectedCount: images.length,
+          decodedCount: imageFiles.length,
+          transport: 'local-file',
+        });
+        sendEvent(res, {
+          type: 'status',
+          message: `Saved ${imageCountText(imageFiles.length)} to local temp files for Claude to inspect.`,
+        });
+      }
       await streamProcess(res, req, config.claudeBin, args, {
         cwd,
         parseLine: parseClaudeLine,
@@ -507,6 +560,18 @@ export async function handleInteractionRequest(req, res, { project, locator, con
       const prompt = buildPrompt(text, imageFiles, false);
       const args = createCopilotArgs(locator, prompt, uploadDir, config);
       sendEvent(res, { type: 'status', message: 'Starting Copilot interaction...' });
+      if (imageFiles.length > 0) {
+        sendEvent(res, {
+          type: 'image_state',
+          selectedCount: images.length,
+          decodedCount: imageFiles.length,
+          transport: 'local-file',
+        });
+        sendEvent(res, {
+          type: 'status',
+          message: `Saved ${imageCountText(imageFiles.length)} to local temp files for Copilot to inspect.`,
+        });
+      }
       if (locator.draft && locator.rawSessionId) {
         sendEvent(res, { type: 'session_created', source: 'copilot', rawSessionId: locator.rawSessionId });
       }

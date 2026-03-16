@@ -7,14 +7,16 @@ let sessionMeta = null;
 let messages = [];
 let offset = 0;
 const PAGE_SIZE = 50;
+const POLL_INTERVAL_MS = 4000;
 let projectList = [];
 let sessionList = [];
 let totalMessages = 0;
 let isLoading = false;
 let hasMoreOlder = false;
-let transientMessages = [];
+const transientMessagesBySession = new Map();
 let draftSessions = [];
 let dashboardCapabilities = null;
+let pollInFlight = false;
 
 function getDashboardSelection() {
   return {
@@ -31,7 +33,7 @@ function notifySessionSelection() {
 }
 
 function currentMessageList() {
-  return [...messages, ...transientMessages];
+  return [...messages, ...(transientMessagesBySession.get(selectedSession) || [])];
 }
 
 function displayedSessionList() {
@@ -40,6 +42,10 @@ function displayedSessionList() {
 
 function findSessionMetaById(id) {
   return displayedSessionList().find((session) => session.sessionId === id) || null;
+}
+
+function currentSessionHasTransientActivity() {
+  return !!(selectedSession && (transientMessagesBySession.get(selectedSession) || []).length);
 }
 
 function renderCurrentChat() {
@@ -55,26 +61,33 @@ function scrollChatToBottom() {
   });
 }
 
-function setTransientMessages(nextMessages) {
-  transientMessages = Array.isArray(nextMessages) ? nextMessages.slice() : [];
+function setTransientMessagesForSession(sessionId, nextMessages) {
+  if (!sessionId) return;
+  const normalized = Array.isArray(nextMessages) ? nextMessages.slice() : [];
+  if (normalized.length > 0) {
+    transientMessagesBySession.set(sessionId, normalized);
+  } else {
+    transientMessagesBySession.delete(sessionId);
+  }
   renderCurrentChat();
   scrollChatToBottom();
 }
 
-function clearTransientMessages() {
-  transientMessages = [];
+function clearTransientMessagesForSession(sessionId) {
+  if (!sessionId) return;
+  transientMessagesBySession.delete(sessionId);
   renderCurrentChat();
   scrollChatToBottom();
 }
 
-window.__dashboardSetTransientMessages = setTransientMessages;
-window.__dashboardClearTransientMessages = clearTransientMessages;
+window.__dashboardSetTransientMessagesForSession = setTransientMessagesForSession;
+window.__dashboardClearTransientMessagesForSession = clearTransientMessagesForSession;
 
 async function reloadCurrentSession() {
   if (!selectedProject || !selectedSession) return;
   offset = 0;
   messages = [];
-  transientMessages = [];
+  transientMessagesBySession.delete(selectedSession);
   await loadMessages(selectedProject, selectedSession, false);
 }
 
@@ -175,10 +188,13 @@ function selectSessionById(sessionId, options = {}) {
 
   if (meta.isDraft) {
     messages = [];
-    transientMessages = [];
     hasMoreOlder = false;
     totalMessages = 0;
-    document.getElementById('chat-messages').innerHTML = '<div class="empty-state">New session ready. Send a message to create it.</div>';
+    if ((transientMessagesBySession.get(selectedSession) || []).length > 0) {
+      renderCurrentChat();
+    } else {
+      document.getElementById('chat-messages').innerHTML = '<div class="empty-state">New session ready. Send a message to create it.</div>';
+    }
     return;
   }
 
@@ -199,6 +215,14 @@ async function loadProjects() {
   updateStatusBar();
 }
 
+async function refreshProjectsSilently() {
+  const data = await fetchJSON('/api/projects');
+  if (!data) return;
+  projectList = data;
+  renderProjectList(projectList, selectedProject);
+  updateStatusBar();
+}
+
 async function loadSessions(projectDir, matcher = null) {
   selectedProject = projectDir;
   selectedSession = null;
@@ -211,7 +235,6 @@ async function loadSessions(projectDir, matcher = null) {
   renderProjectList(projectList, selectedProject);
   renderChatHeader(null);
   document.getElementById('chat-messages').innerHTML = '<div class="empty-state">Select a session to view conversation</div>';
-  transientMessages = [];
   notifySessionSelection();
   renderSessionActions();
 
@@ -236,6 +259,45 @@ async function loadSessions(projectDir, matcher = null) {
     if (matched) {
       selectSessionById(matched.sessionId);
     }
+  }
+}
+
+async function pollSelectedSessionUpdates() {
+  if (pollInFlight || document.hidden) return;
+  if (!selectedProject) return;
+  if (currentSessionHasTransientActivity()) return;
+
+  pollInFlight = true;
+  try {
+    await refreshProjectsSilently();
+
+    const data = await fetchJSON(`/api/sessions/${encodeURIComponent(selectedProject)}`);
+    if (!data) return;
+
+    const previousMeta = selectedSession ? sessionList.find((session) => session.sessionId === selectedSession) || sessionMeta : null;
+    sessionList = data;
+    renderSessionList(displayedSessionList(), selectedSession);
+
+    if (!selectedSession) return;
+    if (sessionMeta && sessionMeta.isDraft) return;
+
+    const nextMeta = sessionList.find((session) => session.sessionId === selectedSession);
+    if (!nextMeta) return;
+
+    const changed =
+      !previousMeta ||
+      previousMeta.modified !== nextMeta.modified ||
+      previousMeta.messageCount !== nextMeta.messageCount ||
+      previousMeta.model !== nextMeta.model;
+
+    sessionMeta = nextMeta;
+    renderChatHeader(sessionMeta);
+
+    if (changed && !isLoading) {
+      await loadMessages(selectedProject, selectedSession, false);
+    }
+  } finally {
+    pollInFlight = false;
   }
 }
 
@@ -340,4 +402,8 @@ document.addEventListener('DOMContentLoaded', () => {
 
   // Load projects on start
   loadProjects();
+
+  window.setInterval(() => {
+    pollSelectedSessionUpdates();
+  }, POLL_INTERVAL_MS);
 });

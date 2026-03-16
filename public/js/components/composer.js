@@ -9,6 +9,8 @@ let composerTransientMessages = [];
 let composerTransientCounter = 0;
 const COMPOSER_MAX_HEIGHT = 260;
 let composerCreatedSession = null;
+let composerActiveSessionId = null;
+let composerImageState = null;
 
 function composerEl(id) {
   return document.getElementById(id);
@@ -17,6 +19,14 @@ function composerEl(id) {
 function currentCapability() {
   const source = composerSelection.sessionMeta && composerSelection.sessionMeta.source;
   return source && composerCapabilities ? composerCapabilities[source] : null;
+}
+
+function imageSummaryText(selectedCount, decodedCount, transport) {
+  if (!selectedCount) return '';
+  if (decodedCount === 0) return `Backend accepted 0/${selectedCount} images.`;
+  if (transport === 'native') return `Backend accepted ${decodedCount}/${selectedCount} images and attached them natively.`;
+  if (transport === 'local-file') return `Backend accepted ${decodedCount}/${selectedCount} images and stored them as local files.`;
+  return `Backend accepted ${decodedCount}/${selectedCount} images.`;
 }
 
 function autoResizeComposer() {
@@ -37,15 +47,55 @@ function setComposerStatus(text, isError) {
   statusEl.classList.toggle('is-error', !!isError);
 }
 
+function renderImageStateBar() {
+  const container = composerEl('composer-image-state');
+  if (!container) return;
+
+  if (!composerImageState) {
+    container.innerHTML = '';
+    return;
+  }
+
+  const level = composerImageState.decodedCount === 0
+    ? 'error'
+    : composerImageState.decodedCount < composerImageState.selectedCount
+      ? 'warn'
+      : 'ok';
+
+  const summary = imageSummaryText(
+    composerImageState.selectedCount,
+    composerImageState.decodedCount,
+    composerImageState.transport
+  );
+
+  container.innerHTML = `
+    <div class="composer-image-pill ${level}">
+      <span class="composer-image-pill-label">IMAGE</span>
+      <span>${escapeHtml(summary)}</span>
+    </div>
+  `;
+}
+
 function syncTransientTimeline() {
-  if (typeof window.__dashboardSetTransientMessages === 'function') {
-    window.__dashboardSetTransientMessages(composerTransientMessages);
+  if (
+    composerActiveSessionId &&
+    typeof window.__dashboardSetTransientMessagesForSession === 'function'
+  ) {
+    window.__dashboardSetTransientMessagesForSession(
+      composerActiveSessionId,
+      composerTransientMessages
+    );
   }
 }
 
 function resetTransientTimeline() {
   composerTransientMessages = [];
-  syncTransientTimeline();
+  if (
+    composerActiveSessionId &&
+    typeof window.__dashboardClearTransientMessagesForSession === 'function'
+  ) {
+    window.__dashboardClearTransientMessagesForSession(composerActiveSessionId);
+  }
 }
 
 function nextTransientId() {
@@ -118,6 +168,7 @@ function finalizeLiveMessages() {
 
 function resetComposerAttachments() {
   composerAttachments = [];
+  composerImageState = null;
   renderComposer();
 }
 
@@ -166,7 +217,11 @@ function renderComposer() {
   } else if (!capability) {
     metaEl.textContent = 'Loading capabilities...';
   } else {
-    metaEl.textContent = capability.note;
+    const parts = [capability.note];
+    if (composerAttachments.length > 0) {
+      parts.push(`Selected ${composerAttachments.length} image${composerAttachments.length === 1 ? '' : 's'}.`);
+    }
+    metaEl.textContent = parts.filter(Boolean).join(' ');
   }
 
   textarea.disabled = !enabled;
@@ -178,6 +233,7 @@ function renderComposer() {
     : 'Type a message. Images will be saved locally and referenced in the prompt.';
 
   renderAttachments();
+  renderImageStateBar();
   autoResizeComposer();
 }
 
@@ -210,6 +266,21 @@ function clearComposerInput() {
   composerEl('composer-input').value = '';
   resetComposerAttachments();
   autoResizeComposer();
+}
+
+function cloneAttachmentsForRequest() {
+  return composerAttachments.map((attachment) => ({ ...attachment }));
+}
+
+function formatOutboundUserContent(text, imageCount) {
+  const trimmed = typeof text === 'string' ? text.trim() : '';
+  const imageLine = imageCount > 0
+    ? `[${imageCount} image${imageCount === 1 ? '' : 's'} attached]`
+    : '';
+
+  if (trimmed && imageLine) return `${trimmed}\n\n${imageLine}`;
+  if (trimmed) return trimmed;
+  return imageLine;
 }
 
 function consumeNdjsonChunk(buffer, handleEvent) {
@@ -250,6 +321,16 @@ function applyStreamEvent(event) {
       source: event.source,
       rawSessionId: event.rawSessionId,
     };
+    return;
+  }
+
+  if (event.type === 'image_state') {
+    composerImageState = {
+      selectedCount: event.selectedCount || 0,
+      decodedCount: event.decodedCount || 0,
+      transport: event.transport || '',
+    };
+    renderComposer();
     return;
   }
 
@@ -327,12 +408,15 @@ async function submitComposer() {
   if (!text && composerAttachments.length === 0) return;
 
   const outboundText = textarea.value;
+  const outboundImages = cloneAttachmentsForRequest();
   composerSending = true;
+  composerActiveSessionId = composerSelection.session;
   composerCreatedSession = null;
+  composerImageState = null;
   resetTransientTimeline();
   pushTransientMessage({
     type: 'user',
-    content: outboundText,
+    content: formatOutboundUserContent(outboundText, outboundImages.length),
     pending: true,
     live: false,
   });
@@ -349,7 +433,7 @@ async function submitComposer() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           text,
-          images: composerAttachments,
+          images: outboundImages,
         }),
       }
     );
@@ -373,12 +457,21 @@ async function submitComposer() {
     buffer += decoder.decode();
     consumeNdjsonChunk(buffer, applyStreamEvent);
     setTimeout(() => {
+      const latestSelection = typeof window.__dashboardGetSelection === 'function'
+        ? window.__dashboardGetSelection()
+        : null;
       if (
         composerCreatedSession &&
+        latestSelection &&
+        latestSelection.session === composerActiveSessionId &&
         typeof window.__dashboardReloadSessionsAndSelect === 'function'
       ) {
-        window.__dashboardReloadSessionsAndSelect(composerSelection.project, composerCreatedSession);
-      } else if (typeof window.reloadCurrentSession === 'function') {
+        window.__dashboardReloadSessionsAndSelect(latestSelection.project, composerCreatedSession);
+      } else if (
+        latestSelection &&
+        latestSelection.session === composerActiveSessionId &&
+        typeof window.reloadCurrentSession === 'function'
+      ) {
         window.reloadCurrentSession();
       }
     }, 800);
@@ -410,8 +503,6 @@ function initComposer() {
 
   document.addEventListener('session:selected', (event) => {
     composerSelection = event.detail || { project: null, session: null, sessionMeta: null };
-    composerCreatedSession = null;
-    resetTransientTimeline();
     renderComposer();
   });
 

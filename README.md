@@ -37,3 +37,44 @@ npm start
 ```
 
 See full setup: [English](README_EN.md) · [中文](README_CN.md)
+
+---
+
+### Contributing / 贡献
+
+Issues, feature requests, and pull requests are welcome.
+If you want to improve the dashboard, add support for another CLI, or refine the interaction experience, please open an issue or submit a pull request:
+
+- Issues: <https://github.com/Stepuuu/multi-cli-session-dashboard/issues>
+- Pull Requests: <https://github.com/Stepuuu/multi-cli-session-dashboard/pulls>
+
+欢迎提交 Issue、功能建议和 Pull Request。
+如果你想改进这个 dashboard、支持新的 CLI 工具，或优化交互体验，可以直接提交 issue 或 PR：
+
+- Issues: <https://github.com/Stepuuu/multi-cli-session-dashboard/issues>
+- Pull Requests: <https://github.com/Stepuuu/multi-cli-session-dashboard/pulls>
+
+---
+
+### Citation / 引用
+
+If this project helps your workflow, research, or tool-building, please cite it:
+
+如果本项目对你的工作流、研究或工具开发有帮助，欢迎引用：
+
+```bibtex
+@misc{multi-cli-session-dashboard,
+  author       = {Stepuuu},
+  title        = {CLI Session Dashboard: A Self-hosted Dashboard for Browsing and Continuing Local AI CLI Sessions},
+  year         = {2026},
+  publisher    = {GitHub},
+  howpublished = {\url{https://github.com/Stepuuu/multi-cli-session-dashboard}},
+}
+```
+
+---
+
+<div align="center">
+  <b>One dashboard for your local AI CLI sessions · 一个面板管理多种本地 AI CLI 会话</b><br>
+  <a href="https://github.com/Stepuuu/multi-cli-session-dashboard">GitHub</a> · MIT License
+</div>

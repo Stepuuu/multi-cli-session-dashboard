@@ -151,6 +151,37 @@ http://localhost:3456
 - 会话全文检索
 - 导出和归档功能
 
+## 贡献
+
+欢迎提交 Issue、功能建议和 Pull Request。
+
+如果你想改进这个 dashboard、接入新的 CLI、或者优化浏览器侧交互体验，可以直接提交 issue 或 PR：
+
+- Issues: <https://github.com/Stepuuu/multi-cli-session-dashboard/issues>
+- Pull Requests: <https://github.com/Stepuuu/multi-cli-session-dashboard/pulls>
+
+比较适合优先贡献的方向：
+
+- 支持更多 AI CLI 工具
+- 登录鉴权和多人部署
+- 搜索和索引能力增强
+- 更丰富的工具事件 / 产物渲染
+- 更好的导出和归档体验
+
+## 引用
+
+如果本项目对你的工作流、研究或内部工具开发有帮助，欢迎引用：
+
+```bibtex
+@misc{multi-cli-session-dashboard,
+  author       = {Stepuuu},
+  title        = {CLI Session Dashboard: A Self-hosted Dashboard for Browsing and Continuing Local AI CLI Sessions},
+  year         = {2026},
+  publisher    = {GitHub},
+  howpublished = {\url{https://github.com/Stepuuu/multi-cli-session-dashboard}},
+}
+```
+
 ## 开源许可
 
 MIT
