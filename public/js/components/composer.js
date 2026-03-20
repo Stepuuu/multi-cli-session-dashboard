@@ -2,18 +2,26 @@
 
 let composerCapabilities = null;
 let composerAttachments = [];
-let composerSending = false;
-let composerStatus = 'Idle';
 let composerSelection = { project: null, session: null, sessionMeta: null };
-let composerTransientMessages = [];
 let composerTransientCounter = 0;
 const COMPOSER_MAX_HEIGHT = 260;
-let composerCreatedSession = null;
-let composerActiveSessionId = null;
-let composerImageState = null;
+
+const composerSendingSessions = new Set();
+const composerStatusBySession = new Map();
+const composerTransientMessagesBySession = new Map();
+const composerImageStateBySession = new Map();
+const composerControllersBySession = new Map();
 
 function composerEl(id) {
   return document.getElementById(id);
+}
+
+function currentSessionId() {
+  return composerSelection.session || '';
+}
+
+function currentSessionMeta() {
+  return composerSelection.sessionMeta || null;
 }
 
 function currentCapability() {
@@ -39,11 +47,21 @@ function autoResizeComposer() {
   textarea.style.overflowY = textarea.scrollHeight > COMPOSER_MAX_HEIGHT ? 'auto' : 'hidden';
 }
 
-function setComposerStatus(text, isError) {
-  composerStatus = text || 'Idle';
+function getComposerStatus(sessionId) {
+  return composerStatusBySession.get(sessionId) || { text: 'Idle', isError: false };
+}
+
+function setComposerStatusForSession(sessionId, text, isError) {
+  if (!sessionId) return;
+  composerStatusBySession.set(sessionId, {
+    text: text || 'Idle',
+    isError: !!isError,
+  });
+
+  if (sessionId !== currentSessionId()) return;
   const statusEl = composerEl('composer-status');
   if (!statusEl) return;
-  statusEl.textContent = composerStatus;
+  statusEl.textContent = text || 'Idle';
   statusEl.classList.toggle('is-error', !!isError);
 }
 
@@ -51,21 +69,22 @@ function renderImageStateBar() {
   const container = composerEl('composer-image-state');
   if (!container) return;
 
-  if (!composerImageState) {
+  const imageState = composerImageStateBySession.get(currentSessionId());
+  if (!imageState) {
     container.innerHTML = '';
     return;
   }
 
-  const level = composerImageState.decodedCount === 0
+  const level = imageState.decodedCount === 0
     ? 'error'
-    : composerImageState.decodedCount < composerImageState.selectedCount
+    : imageState.decodedCount < imageState.selectedCount
       ? 'warn'
       : 'ok';
 
   const summary = imageSummaryText(
-    composerImageState.selectedCount,
-    composerImageState.decodedCount,
-    composerImageState.transport
+    imageState.selectedCount,
+    imageState.decodedCount,
+    imageState.transport
   );
 
   container.innerHTML = `
@@ -76,25 +95,29 @@ function renderImageStateBar() {
   `;
 }
 
-function syncTransientTimeline() {
+function getTransientMessages(sessionId) {
+  return composerTransientMessagesBySession.get(sessionId) || [];
+}
+
+function syncTransientTimelineForSession(sessionId) {
   if (
-    composerActiveSessionId &&
+    sessionId === currentSessionId() &&
     typeof window.__dashboardSetTransientMessagesForSession === 'function'
   ) {
     window.__dashboardSetTransientMessagesForSession(
-      composerActiveSessionId,
-      composerTransientMessages
+      sessionId,
+      getTransientMessages(sessionId)
     );
   }
 }
 
-function resetTransientTimeline() {
-  composerTransientMessages = [];
+function resetTransientTimelineForSession(sessionId) {
+  composerTransientMessagesBySession.delete(sessionId);
   if (
-    composerActiveSessionId &&
+    sessionId === currentSessionId() &&
     typeof window.__dashboardClearTransientMessagesForSession === 'function'
   ) {
-    window.__dashboardClearTransientMessagesForSession(composerActiveSessionId);
+    window.__dashboardClearTransientMessagesForSession(sessionId);
   }
 }
 
@@ -103,42 +126,42 @@ function nextTransientId() {
   return `composer-tmp-${composerTransientCounter}`;
 }
 
-function markAllTransientNotLive() {
-  composerTransientMessages = composerTransientMessages.map((msg) => ({ ...msg, live: false }));
+function markAllTransientNotLive(sessionId) {
+  const next = getTransientMessages(sessionId).map((msg) => ({ ...msg, live: false }));
+  composerTransientMessagesBySession.set(sessionId, next);
 }
 
-function pushTransientMessage(message) {
+function pushTransientMessageForSession(sessionId, sessionMeta, message) {
   const transientMessage = {
     timestamp: new Date().toISOString(),
-    source: composerSelection.sessionMeta ? composerSelection.sessionMeta.source : '',
-    sourceLabel: composerSelection.sessionMeta ? composerSelection.sessionMeta.sourceLabel : '',
-    sourceShortLabel: composerSelection.sessionMeta ? composerSelection.sessionMeta.sourceShortLabel : '',
+    source: sessionMeta ? sessionMeta.source : '',
+    sourceLabel: sessionMeta ? sessionMeta.sourceLabel : '',
+    sourceShortLabel: sessionMeta ? sessionMeta.sourceShortLabel : '',
     ...message,
     _transientId: message._transientId || nextTransientId(),
   };
-  composerTransientMessages = [...composerTransientMessages, transientMessage];
-  syncTransientTimeline();
+  const next = [...getTransientMessages(sessionId), transientMessage];
+  composerTransientMessagesBySession.set(sessionId, next);
+  syncTransientTimelineForSession(sessionId);
   return transientMessage._transientId;
 }
 
-function updateTransientMessage(id, patch) {
-  composerTransientMessages = composerTransientMessages.map((msg) => (
+function updateTransientMessageForSession(sessionId, id, patch) {
+  const next = getTransientMessages(sessionId).map((msg) => (
     msg._transientId === id ? { ...msg, ...patch } : msg
   ));
-  syncTransientTimeline();
+  composerTransientMessagesBySession.set(sessionId, next);
+  syncTransientTimelineForSession(sessionId);
 }
 
-function ensureLiveAssistantMessage() {
-  const existing = composerTransientMessages.find((msg) => msg._transientKind === 'assistant-live');
+function ensureLiveAssistantMessage(sessionId, sessionMeta) {
+  const existing = getTransientMessages(sessionId).find((msg) => msg._transientKind === 'assistant-live');
   if (existing) return existing._transientId;
 
-  markAllTransientNotLive();
-  return pushTransientMessage({
+  markAllTransientNotLive(sessionId);
+  return pushTransientMessageForSession(sessionId, sessionMeta, {
     type: 'assistant',
-    roleLabel: (
-      composerSelection.sessionMeta &&
-      (composerSelection.sessionMeta.sourceLabel || composerSelection.sessionMeta.sourceShortLabel)
-    ) || 'ASSISTANT',
+    roleLabel: (sessionMeta && (sessionMeta.sourceLabel || sessionMeta.sourceShortLabel)) || 'ASSISTANT',
     content: '正在回复...',
     live: true,
     pending: true,
@@ -146,9 +169,9 @@ function ensureLiveAssistantMessage() {
   });
 }
 
-function pushLiveStatusMessage(text, isError, type = 'status') {
-  markAllTransientNotLive();
-  return pushTransientMessage({
+function pushLiveStatusMessage(sessionId, sessionMeta, text, isError, type = 'status') {
+  markAllTransientNotLive(sessionId);
+  return pushTransientMessageForSession(sessionId, sessionMeta, {
     type,
     content: text,
     live: true,
@@ -157,18 +180,19 @@ function pushLiveStatusMessage(text, isError, type = 'status') {
   });
 }
 
-function finalizeLiveMessages() {
-  composerTransientMessages = composerTransientMessages.map((msg) => ({
+function finalizeLiveMessages(sessionId) {
+  const next = getTransientMessages(sessionId).map((msg) => ({
     ...msg,
     live: false,
     pending: false,
   }));
-  syncTransientTimeline();
+  composerTransientMessagesBySession.set(sessionId, next);
+  syncTransientTimelineForSession(sessionId);
 }
 
 function resetComposerAttachments() {
   composerAttachments = [];
-  composerImageState = null;
+  composerImageStateBySession.delete(currentSessionId());
   renderComposer();
 }
 
@@ -185,6 +209,9 @@ function renderAttachments() {
     return;
   }
 
+  const currentId = currentSessionId();
+  const sending = composerSendingSessions.has(currentId);
+
   container.innerHTML = composerAttachments.map((attachment, index) => `
     <div class="composer-attachment">
       <img src="${escapeHtml(attachment.dataUrl)}" alt="${escapeHtml(attachment.name)}" class="composer-attachment-thumb">
@@ -192,7 +219,7 @@ function renderAttachments() {
         <span class="composer-attachment-name">${escapeHtml(attachment.name)}</span>
         <span class="composer-attachment-type">${escapeHtml(attachment.type)}</span>
       </div>
-      <button class="composer-attachment-remove" data-index="${index}" ${composerSending ? 'disabled' : ''}>×</button>
+      <button class="composer-attachment-remove" data-index="${index}" ${sending ? 'disabled' : ''}>×</button>
     </div>
   `).join('');
 
@@ -206,11 +233,16 @@ function renderAttachments() {
 function renderComposer() {
   const textarea = composerEl('composer-input');
   const sendBtn = composerEl('composer-send');
+  const stopBtn = composerEl('composer-stop');
   const uploadBtn = composerEl('composer-upload');
   const metaEl = composerEl('composer-meta');
+  const statusEl = composerEl('composer-status');
   const capability = currentCapability();
   const selected = !!(composerSelection.project && composerSelection.session && composerSelection.sessionMeta);
-  const enabled = selected && capability && capability.enabled && !composerSending;
+  const sessionId = currentSessionId();
+  const sending = composerSendingSessions.has(sessionId);
+  const enabled = selected && capability && capability.enabled && !sending;
+  const status = getComposerStatus(sessionId);
 
   if (!selected) {
     metaEl.textContent = 'Select a session to start interacting.';
@@ -226,11 +258,18 @@ function renderComposer() {
 
   textarea.disabled = !enabled;
   sendBtn.disabled = !enabled || (!textarea.value.trim() && composerAttachments.length === 0);
+  stopBtn.disabled = !sending;
   uploadBtn.disabled = !enabled;
-  sendBtn.textContent = composerSending ? 'Sending...' : 'Send';
+  sendBtn.textContent = sending ? 'Sending...' : 'Send';
+  stopBtn.textContent = 'Stop';
   textarea.placeholder = capability && capability.directImages
     ? 'Type a message. Images will be attached directly.'
     : 'Type a message. Images will be saved locally and referenced in the prompt.';
+
+  if (statusEl) {
+    statusEl.textContent = status.text;
+    statusEl.classList.toggle('is-error', !!status.isError);
+  }
 
   renderAttachments();
   renderImageStateBar();
@@ -247,7 +286,7 @@ function fileToDataUrl(file) {
 }
 
 async function addComposerFiles(fileList) {
-  if (composerSending) return;
+  if (composerSendingSessions.has(currentSessionId())) return;
 
   const incoming = Array.from(fileList || []).filter((file) => file.type.startsWith('image/'));
   for (const file of incoming) {
@@ -300,147 +339,214 @@ function consumeNdjsonChunk(buffer, handleEvent) {
   return rest;
 }
 
-function applyStreamEvent(event) {
-  if (event.type === 'status') {
-    setComposerStatus(event.message || 'Working...', false);
-    pushLiveStatusMessage(event.message || 'Working...', false, 'status');
+function buildStreamEventHandler(sessionId, sessionMeta, requestState) {
+  return function applyStreamEvent(event) {
+    if (event.type === 'status') {
+      setComposerStatusForSession(sessionId, event.message || 'Working...', false);
+      pushLiveStatusMessage(sessionId, sessionMeta, event.message || 'Working...', false, 'status');
+      return;
+    }
+
+    if (event.type === 'meta') {
+      const sourceLabel = (sessionMeta && (sessionMeta.sourceLabel || sessionMeta.sourceShortLabel)) || event.source;
+      setComposerStatusForSession(sessionId, `Connected to ${sourceLabel}`, false);
+      return;
+    }
+
+    if (event.type === 'session_created') {
+      requestState.createdSession = {
+        source: event.source,
+        rawSessionId: event.rawSessionId,
+      };
+      if (typeof window.__dashboardRememberCreatedSessionForDraft === 'function') {
+        window.__dashboardRememberCreatedSessionForDraft(sessionId, requestState.createdSession);
+      }
+      return;
+    }
+
+    if (event.type === 'image_state') {
+      composerImageStateBySession.set(sessionId, {
+        selectedCount: event.selectedCount || 0,
+        decodedCount: event.decodedCount || 0,
+        transport: event.transport || '',
+      });
+      if (sessionId === currentSessionId()) {
+        renderComposer();
+      }
+      return;
+    }
+
+    if (event.type === 'tool_event') {
+      setComposerStatusForSession(sessionId, event.message || 'Tool running...', false);
+      pushLiveStatusMessage(sessionId, sessionMeta, event.message || 'Tool running...', false, 'tool_event');
+      return;
+    }
+
+    if (event.type === 'tool_result') {
+      setComposerStatusForSession(sessionId, 'Tool completed.', false);
+      markAllTransientNotLive(sessionId);
+      pushTransientMessageForSession(sessionId, sessionMeta, {
+        type: 'tool_result',
+        content: event.message || '',
+        live: false,
+        pending: false,
+        _transientKind: 'tool-result',
+      });
+      return;
+    }
+
+    if (event.type === 'assistant_delta') {
+      setComposerStatusForSession(sessionId, '正在回复...', false);
+      const messageId = ensureLiveAssistantMessage(sessionId, sessionMeta);
+      const current = getTransientMessages(sessionId).find((msg) => msg._transientId === messageId);
+      const currentText = typeof current?.content === 'string' && current.content !== '正在回复...'
+        ? current.content
+        : '';
+      updateTransientMessageForSession(sessionId, messageId, {
+        content: currentText + (event.text || ''),
+        live: true,
+        pending: true,
+        timestamp: new Date().toISOString(),
+      });
+      return;
+    }
+
+    if (event.type === 'assistant_final') {
+      setComposerStatusForSession(sessionId, '已收到回复', false);
+      const existing = getTransientMessages(sessionId).find((msg) => msg._transientKind === 'assistant-live');
+      if (existing) {
+        updateTransientMessageForSession(sessionId, existing._transientId, {
+          content: event.text || existing.content,
+          live: false,
+          pending: false,
+          timestamp: new Date().toISOString(),
+        });
+      } else {
+        pushTransientMessageForSession(sessionId, sessionMeta, {
+          type: 'assistant',
+          roleLabel: (sessionMeta && (sessionMeta.sourceLabel || sessionMeta.sourceShortLabel)) || 'ASSISTANT',
+          content: event.text || '',
+          live: false,
+          pending: false,
+        });
+      }
+      return;
+    }
+
+    if (event.type === 'error') {
+      setComposerStatusForSession(sessionId, event.message || 'Interaction failed.', true);
+      pushLiveStatusMessage(sessionId, sessionMeta, `Error: ${event.message || 'Interaction failed.'}`, true);
+      return;
+    }
+
+    if (event.type === 'done') {
+      finalizeLiveMessages(sessionId);
+      setComposerStatusForSession(sessionId, 'Done', false);
+      if (typeof window.__dashboardMarkSessionNeedsHydration === 'function') {
+        window.__dashboardMarkSessionNeedsHydration(sessionId);
+      }
+    }
+  }
+}
+
+function stopComposerForSession(sessionId, options = {}) {
+  const controller = composerControllersBySession.get(sessionId);
+  if (!controller) return false;
+
+  composerControllersBySession.delete(sessionId);
+  composerSendingSessions.delete(sessionId);
+  if (typeof window.__dashboardSetSessionActivityState === 'function') {
+    window.__dashboardSetSessionActivityState(sessionId, false, options.projectToken || '');
+  }
+  setComposerStatusForSession(sessionId, options.message || 'Stopped.', false);
+  markAllTransientNotLive(sessionId);
+  pushTransientMessageForSession(sessionId, options.sessionMeta || currentSessionMeta(), {
+    type: 'status',
+    content: options.message || 'Stopped.',
+    live: false,
+    pending: false,
+    _transientKind: 'status-stopped',
+  });
+  renderComposer();
+  controller.abort();
+  return true;
+}
+
+async function finalizeComposerHydration(projectToken, sessionId, requestState) {
+  if (typeof window.__dashboardFinalizeInteractionHydration !== 'function') {
     return;
   }
 
-  if (event.type === 'meta') {
-    const sourceLabel = (
-      composerSelection.sessionMeta &&
-      (composerSelection.sessionMeta.sourceLabel || composerSelection.sessionMeta.sourceShortLabel)
-    ) || event.source;
-    setComposerStatus(`Connected to ${sourceLabel}`, false);
-    return;
-  }
+  await window.__dashboardFinalizeInteractionHydration({
+    projectToken,
+    sessionId,
+    createdSession: requestState?.createdSession || null,
+  });
+}
 
-  if (event.type === 'session_created') {
-    composerCreatedSession = {
-      source: event.source,
-      rawSessionId: event.rawSessionId,
-    };
-    return;
-  }
+async function submitInteraction({
+  projectToken,
+  sessionId,
+  sessionMeta,
+  sessionToken,
+  text,
+  images = [],
+  visibleText = null,
+}) {
+  if (composerSendingSessions.has(sessionId)) return;
+  if (!projectToken || !sessionToken || !sessionMeta) return;
 
-  if (event.type === 'image_state') {
-    composerImageState = {
-      selectedCount: event.selectedCount || 0,
-      decodedCount: event.decodedCount || 0,
-      transport: event.transport || '',
-    };
+  const capability = composerCapabilities ? composerCapabilities[sessionMeta.source] : null;
+  if (!capability || !capability.enabled) {
+    setComposerStatusForSession(sessionId, capability ? capability.note : 'Interaction is not available.', true);
     renderComposer();
     return;
   }
 
-  if (event.type === 'tool_event') {
-    setComposerStatus(event.message || 'Tool running...', false);
-    pushLiveStatusMessage(event.message || 'Tool running...', false, 'tool_event');
-    return;
+  const normalizedText = typeof text === 'string' ? text : '';
+  const outboundText = visibleText == null ? normalizedText : visibleText;
+  const outboundImages = Array.isArray(images) ? images.map((attachment) => ({ ...attachment })) : [];
+  if (!normalizedText.trim() && outboundImages.length === 0) return;
+
+  composerSendingSessions.add(sessionId);
+  if (typeof window.__dashboardSetSessionActivityState === 'function') {
+    window.__dashboardSetSessionActivityState(sessionId, true, projectToken);
   }
-
-  if (event.type === 'assistant_delta') {
-    setComposerStatus('正在回复...', false);
-    const messageId = ensureLiveAssistantMessage();
-    const current = composerTransientMessages.find((msg) => msg._transientId === messageId);
-    const currentText = typeof current?.content === 'string' && current.content !== '正在回复...'
-      ? current.content
-      : '';
-    updateTransientMessage(messageId, {
-      content: currentText + (event.text || ''),
-      live: true,
-      pending: true,
-      timestamp: new Date().toISOString(),
-    });
-    return;
-  }
-
-  if (event.type === 'assistant_final') {
-    setComposerStatus('已收到回复', false);
-    const existing = composerTransientMessages.find((msg) => msg._transientKind === 'assistant-live');
-    if (existing) {
-      updateTransientMessage(existing._transientId, {
-        content: event.text || existing.content,
-        live: false,
-        pending: false,
-        timestamp: new Date().toISOString(),
-      });
-    } else {
-      pushTransientMessage({
-        type: 'assistant',
-        roleLabel: (
-          composerSelection.sessionMeta &&
-          (composerSelection.sessionMeta.sourceLabel || composerSelection.sessionMeta.sourceShortLabel)
-        ) || 'ASSISTANT',
-        content: event.text || '',
-        live: false,
-        pending: false,
-      });
-    }
-    return;
-  }
-
-  if (event.type === 'error') {
-    setComposerStatus(event.message || 'Interaction failed.', true);
-    pushLiveStatusMessage(`Error: ${event.message || 'Interaction failed.'}`, true);
-    return;
-  }
-
-  if (event.type === 'done') {
-    finalizeLiveMessages();
-    setComposerStatus('Done', false);
-  }
-}
-
-async function submitComposer() {
-  if (composerSending) return;
-  if (!composerSelection.project || !composerSelection.session || !composerSelection.sessionMeta) return;
-
-  const capability = currentCapability();
-  if (!capability || !capability.enabled) {
-    setComposerStatus(capability ? capability.note : 'Interaction is not available.', true);
-    return;
-  }
-
-  const textarea = composerEl('composer-input');
-  const text = textarea.value.trim();
-  if (!text && composerAttachments.length === 0) return;
-
-  const outboundText = textarea.value;
-  const outboundImages = cloneAttachmentsForRequest();
-  composerSending = true;
-  composerActiveSessionId = composerSelection.session;
-  composerCreatedSession = null;
-  composerImageState = null;
-  resetTransientTimeline();
-  pushTransientMessage({
+  composerImageStateBySession.delete(sessionId);
+  resetTransientTimelineForSession(sessionId);
+  pushTransientMessageForSession(sessionId, sessionMeta, {
     type: 'user',
     content: formatOutboundUserContent(outboundText, outboundImages.length),
     pending: true,
     live: false,
   });
   clearComposerInput();
-  pushLiveStatusMessage('已发送，等待代理开始...', false);
-  setComposerStatus('Starting interaction...', false);
+  pushLiveStatusMessage(sessionId, sessionMeta, '已发送，等待代理开始...', false);
+  setComposerStatusForSession(sessionId, 'Starting interaction...', false);
   renderComposer();
 
+  const requestState = { createdSession: null };
+
   try {
+    const handleEvent = buildStreamEventHandler(sessionId, sessionMeta, requestState);
+    const controller = new AbortController();
+    composerControllersBySession.set(sessionId, controller);
     const response = await fetch(
-      `/api/interact/${encodeURIComponent(composerSelection.project)}/${encodeURIComponent(composerSelection.session)}`,
+      `/api/interact/${encodeURIComponent(projectToken)}/${encodeURIComponent(sessionToken)}`,
       {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
+        signal: controller.signal,
         body: JSON.stringify({
-          text,
+          text: normalizedText,
           images: outboundImages,
         }),
       }
     );
 
     if (!response.ok || !response.body) {
-      const text = await response.text();
-      throw new Error(text || `HTTP ${response.status}`);
+      const responseText = await response.text();
+      throw new Error(responseText || `HTTP ${response.status}`);
     }
 
     const reader = response.body.getReader();
@@ -451,42 +557,67 @@ async function submitComposer() {
       const { value, done } = await reader.read();
       if (done) break;
       buffer += decoder.decode(value, { stream: true });
-      buffer = consumeNdjsonChunk(buffer, applyStreamEvent);
+      buffer = consumeNdjsonChunk(buffer, handleEvent);
     }
 
     buffer += decoder.decode();
-    consumeNdjsonChunk(buffer, applyStreamEvent);
+    consumeNdjsonChunk(buffer, handleEvent);
+
     setTimeout(() => {
-      const latestSelection = typeof window.__dashboardGetSelection === 'function'
-        ? window.__dashboardGetSelection()
-        : null;
-      if (
-        composerCreatedSession &&
-        latestSelection &&
-        latestSelection.session === composerActiveSessionId &&
-        typeof window.__dashboardReloadSessionsAndSelect === 'function'
-      ) {
-        window.__dashboardReloadSessionsAndSelect(latestSelection.project, composerCreatedSession);
-      } else if (
-        latestSelection &&
-        latestSelection.session === composerActiveSessionId &&
-        typeof window.reloadCurrentSession === 'function'
-      ) {
-        window.reloadCurrentSession();
-      }
+      finalizeComposerHydration(projectToken, sessionId, requestState);
     }, 800);
   } catch (err) {
-    setComposerStatus(err.message || 'Interaction failed.', true);
-    pushLiveStatusMessage(`Error: ${err.message || 'Interaction failed.'}`, true);
+    if (err.name === 'AbortError') {
+      await finalizeComposerHydration(projectToken, sessionId, requestState);
+      return;
+    }
+    setComposerStatusForSession(sessionId, err.message || 'Interaction failed.', true);
+    pushLiveStatusMessage(sessionId, sessionMeta, `Error: ${err.message || 'Interaction failed.'}`, true);
+    if (typeof window.__dashboardMarkSessionNeedsHydration === 'function') {
+      window.__dashboardMarkSessionNeedsHydration(sessionId);
+    }
+    setTimeout(() => {
+      finalizeComposerHydration(projectToken, sessionId, requestState);
+    }, 600);
   } finally {
-    composerSending = false;
+    composerControllersBySession.delete(sessionId);
+    composerSendingSessions.delete(sessionId);
+    if (typeof window.__dashboardSetSessionActivityState === 'function') {
+      window.__dashboardSetSessionActivityState(sessionId, false, projectToken);
+    }
     renderComposer();
   }
+}
+
+async function submitComposer() {
+  const sessionId = currentSessionId();
+  const sessionMeta = currentSessionMeta();
+  const projectToken = composerSelection.project;
+  const sessionToken = composerSelection.session;
+  if (!projectToken || !sessionToken || !sessionMeta) return;
+
+  const textarea = composerEl('composer-input');
+  const text = textarea.value;
+  if (!text.trim() && composerAttachments.length === 0) return;
+
+  const outboundImages = cloneAttachmentsForRequest();
+  clearComposerInput();
+
+  await submitInteraction({
+    projectToken,
+    sessionId,
+    sessionMeta,
+    sessionToken,
+    text,
+    images: outboundImages,
+    visibleText: text,
+  });
 }
 
 function initComposer() {
   const textarea = composerEl('composer-input');
   const sendBtn = composerEl('composer-send');
+  const stopBtn = composerEl('composer-stop');
   const uploadBtn = composerEl('composer-upload');
   const uploadInput = composerEl('composer-image-input');
 
@@ -497,12 +628,13 @@ function initComposer() {
       renderComposer();
     })
     .catch((err) => {
-      setComposerStatus('Failed to load interaction capabilities.', true);
+      setComposerStatusForSession(currentSessionId(), 'Failed to load interaction capabilities.', true);
       console.error(err);
     });
 
   document.addEventListener('session:selected', (event) => {
     composerSelection = event.detail || { project: null, session: null, sessionMeta: null };
+    composerAttachments = [];
     renderComposer();
   });
 
@@ -539,6 +671,13 @@ function initComposer() {
   });
 
   sendBtn.addEventListener('click', submitComposer);
+  stopBtn.addEventListener('click', () => {
+    stopComposerForSession(currentSessionId(), {
+      sessionMeta: currentSessionMeta(),
+      projectToken: composerSelection.project,
+      message: 'Stopped by user.',
+    });
+  });
 
   const selection = window.__dashboardGetSelection ? window.__dashboardGetSelection() : null;
   if (selection) {
@@ -546,5 +685,7 @@ function initComposer() {
   }
   renderComposer();
 }
+
+window.__dashboardSubmitProgrammaticInteraction = submitInteraction;
 
 document.addEventListener('DOMContentLoaded', initComposer);

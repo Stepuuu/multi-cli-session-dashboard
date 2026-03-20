@@ -281,6 +281,35 @@ function defaultCwd(locator, runtimeConfig) {
     : runtimeConfig.workspaceRoot;
 }
 
+function formatCommandForDisplay(command) {
+  if (typeof command !== 'string') return '';
+  const bashMatch = command.match(/^\/bin\/bash -lc "(.*)"$/s);
+  if (!bashMatch) return command;
+  return bashMatch[1]
+    .replace(/\\"/g, '"')
+    .replace(/\\\\/g, '\\');
+}
+
+function formatCommandResult(item) {
+  const exitCode = Number.isInteger(item?.exit_code) ? item.exit_code : null;
+  const output = typeof item?.aggregated_output === 'string' ? item.aggregated_output.trim() : '';
+  const parts = [];
+  if (exitCode != null) parts.push(`Result: Exit code ${exitCode}`);
+  if (output) {
+    parts.push('```text');
+    parts.push(output);
+    parts.push('```');
+  }
+  return parts.join('\n');
+}
+
+function formatFileChanges(item) {
+  const changes = Array.isArray(item?.changes) ? item.changes : [];
+  if (!changes.length) return 'Updated files.';
+  const lines = changes.map((change) => `- ${change.path}${change.kind ? ` (${change.kind})` : ''}`);
+  return `Updated files:\n${lines.join('\n')}`;
+}
+
 function parseCodexLine(line, res) {
   const obj = safeJsonParse(line);
   if (!obj) {
@@ -295,6 +324,27 @@ function parseCodexLine(line, res) {
   }
   if (obj.type === 'turn.started') {
     sendEvent(res, { type: 'status', message: 'Codex resumed the selected session.' });
+    return;
+  }
+  if (obj.type === 'item.started' && obj.item?.type === 'command_execution') {
+    sendEvent(res, {
+      type: 'tool_event',
+      message: `shell_command\n\`\`\`bash\n${formatCommandForDisplay(obj.item.command)}\n\`\`\``,
+    });
+    return;
+  }
+  if (obj.type === 'item.completed' && obj.item?.type === 'command_execution') {
+    sendEvent(res, {
+      type: 'tool_result',
+      message: formatCommandResult(obj.item),
+    });
+    return;
+  }
+  if (obj.type === 'item.completed' && obj.item?.type === 'file_change') {
+    sendEvent(res, {
+      type: 'tool_event',
+      message: `apply_patch\n${formatFileChanges(obj.item)}`,
+    });
     return;
   }
   if (obj.type === 'item.completed' && obj.item?.type === 'agent_message') {
@@ -410,6 +460,8 @@ function parseCopilotLine(line, res) {
 async function streamProcess(res, req, command, args, options) {
   return new Promise((resolve) => {
     let finished = false;
+    let clientDisconnected = false;
+    let forcedKillTimer = null;
     const child = spawn(command, args, {
       cwd: options.cwd,
       env: { ...process.env, ...(options.env || {}) },
@@ -419,18 +471,49 @@ async function streamProcess(res, req, command, args, options) {
     const finish = (payload) => {
       if (finished) return;
       finished = true;
-      if (payload) sendEvent(res, payload);
-      res.end();
+      if (forcedKillTimer) {
+        clearTimeout(forcedKillTimer);
+        forcedKillTimer = null;
+      }
+      if (!clientDisconnected) {
+        if (payload) sendEvent(res, payload);
+        res.end();
+      }
       resolve();
     };
 
-    req.on('close', () => {
-      if (!finished) {
+    const stopChild = () => {
+      if (finished || child.killed) return;
+      try {
         child.kill('SIGTERM');
+      } catch {
+        return;
       }
+      forcedKillTimer = setTimeout(() => {
+        if (!finished && !child.killed) {
+          try {
+            child.kill('SIGKILL');
+          } catch {
+            // ignore
+          }
+        }
+      }, 1500);
+      forcedKillTimer.unref?.();
+    };
+
+    req.on('aborted', () => {
+      clientDisconnected = true;
+      stopChild();
+    });
+
+    res.on('close', () => {
+      if (finished) return;
+      clientDisconnected = true;
+      stopChild();
     });
 
     processJsonLines(child.stdout, (line) => {
+      if (clientDisconnected || finished) return;
       options.parseLine(line, res);
     });
 
@@ -438,6 +521,7 @@ async function streamProcess(res, req, command, args, options) {
     child.stderr.on('data', (chunk) => {
       const text = chunk.toString('utf-8');
       stderr += text;
+      if (clientDisconnected || finished) return;
       sendEvent(res, { type: 'status', message: truncateText(text.trim(), 400) });
     });
 

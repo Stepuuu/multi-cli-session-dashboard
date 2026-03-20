@@ -31,6 +31,11 @@ const MIME_TYPES = {
   '.ttf': 'font/ttf',
 };
 
+const TRASH_ROOT = '/tmp/session-dashboard-trash';
+const SESSION_TITLE_OVERRIDES_FILE = path.join(__dirname, 'data', 'session-title-overrides.json');
+let sessionTitleOverridesLoaded = false;
+let sessionTitleOverrides = {};
+
 function sendJSON(res, data, status = 200) {
   const body = JSON.stringify(data);
   res.writeHead(status, {
@@ -44,6 +49,28 @@ function sendJSON(res, data, status = 200) {
 
 function sendError(res, message, status = 500) {
   sendJSON(res, { error: message }, status);
+}
+
+async function ensureSessionTitleOverridesLoaded() {
+  if (sessionTitleOverridesLoaded) return;
+  sessionTitleOverridesLoaded = true;
+
+  try {
+    const raw = await fsp.readFile(SESSION_TITLE_OVERRIDES_FILE, 'utf-8');
+    const parsed = JSON.parse(raw);
+    sessionTitleOverrides = parsed && typeof parsed === 'object' ? parsed : {};
+  } catch {
+    sessionTitleOverrides = {};
+  }
+}
+
+async function persistSessionTitleOverrides() {
+  await fsp.mkdir(path.dirname(SESSION_TITLE_OVERRIDES_FILE), { recursive: true });
+  await fsp.writeFile(
+    SESSION_TITLE_OVERRIDES_FILE,
+    JSON.stringify(sessionTitleOverrides, null, 2) + '\n',
+    'utf-8',
+  );
 }
 
 async function serveStatic(req, res) {
@@ -94,6 +121,24 @@ function decodeToken(token) {
   } catch {
     return null;
   }
+}
+
+function buildSessionTitleOverrideKey({ source, projectPath, rawSessionId }) {
+  if (!source || !projectPath || !rawSessionId) return '';
+  return JSON.stringify({ source, projectPath, rawSessionId });
+}
+
+function applySessionTitleOverride(session) {
+  const defaultFirstPrompt = session.firstPrompt || '(no prompt)';
+  const key = buildSessionTitleOverrideKey(session);
+  const customTitle = key ? sessionTitleOverrides[key] || '' : '';
+
+  return {
+    ...session,
+    defaultFirstPrompt,
+    customTitle,
+    firstPrompt: customTitle || defaultFirstPrompt,
+  };
 }
 
 function truncateText(text, limit = 500) {
@@ -233,6 +278,28 @@ async function pathExists(filePath) {
   } catch {
     return false;
   }
+}
+
+async function movePathToTrash(sourcePath, bucket) {
+  await fsp.mkdir(path.join(TRASH_ROOT, bucket), { recursive: true });
+  const targetPath = path.join(
+    TRASH_ROOT,
+    bucket,
+    `${Date.now()}-${path.basename(sourcePath)}`
+  );
+
+  try {
+    await fsp.rename(sourcePath, targetPath);
+  } catch (err) {
+    if (err && err.code === 'EXDEV') {
+      await fsp.cp(sourcePath, targetPath, { recursive: true });
+      await fsp.rm(sourcePath, { recursive: true, force: true });
+    } else {
+      throw err;
+    }
+  }
+
+  return targetPath;
 }
 
 async function walkFiles(rootDir, predicate, acc = []) {
@@ -699,13 +766,15 @@ async function collectCopilotSessions() {
 }
 
 async function collectAllSessions() {
+  await ensureSessionTitleOverridesLoaded();
+
   const [claude, codex, copilot] = await Promise.all([
     collectClaudeSessions(),
     collectCodexSessions(),
     collectCopilotSessions(),
   ]);
 
-  return [...claude, ...codex, ...copilot];
+  return [...claude, ...codex, ...copilot].map(applySessionTitleOverride);
 }
 
 function buildProjectRows(sessions) {
@@ -735,7 +804,12 @@ function buildProjectRows(sessions) {
     );
   }
 
-  return [...projectMap.values()].sort((a, b) => a.name.localeCompare(b.name));
+  return [...projectMap.values()].sort((a, b) => {
+    if (b.latestModified !== a.latestModified) {
+      return b.latestModified - a.latestModified;
+    }
+    return a.name.localeCompare(b.name);
+  });
 }
 
 function buildDraftSession(projectPath, source) {
@@ -749,6 +823,7 @@ function buildDraftSession(projectPath, source) {
     sourceLabel: label.label,
     sourceShortLabel: label.shortLabel,
     projectPath,
+    projectDir: encodeToken({ projectPath }),
     projectName: displayNameFromPath(projectPath),
     rawSessionId,
     firstPrompt: `(new ${label.label} session)`,
@@ -1295,6 +1370,110 @@ async function loadMessagesForLocator(locator) {
   return [];
 }
 
+function resolveSessionStorage(locator) {
+  if (!locator || !locator.source) return null;
+
+  if (locator.source === 'claude') {
+    return {
+      source: 'claude',
+      filePath: path.join(
+        config.claudeProjectsDir,
+        locator.projectDir,
+        `${locator.rawSessionId}.jsonl`
+      ),
+      sessionsIndexPath: path.join(
+        config.claudeProjectsDir,
+        locator.projectDir,
+        'sessions-index.json'
+      ),
+      rawSessionId: locator.rawSessionId,
+    };
+  }
+
+  if (locator.source === 'codex') {
+    return {
+      source: 'codex',
+      filePath: path.join(config.codexSessionsDir, locator.relativePath),
+    };
+  }
+
+  if (locator.source === 'copilot') {
+    return {
+      source: 'copilot',
+      dirPath: path.join(config.copilotSessionStateDir, locator.sessionDir),
+    };
+  }
+
+  return null;
+}
+
+async function cleanupClaudeSessionIndex(indexPath, rawSessionId) {
+  try {
+    const raw = await fsp.readFile(indexPath, 'utf-8');
+    const data = JSON.parse(raw);
+    if (!Array.isArray(data.entries)) return;
+    data.entries = data.entries.filter((entry) => entry.sessionId !== rawSessionId);
+    await fsp.writeFile(indexPath, JSON.stringify(data, null, 2) + '\n', 'utf-8');
+  } catch {
+    // ignore index cleanup failure
+  }
+}
+
+async function handleDeleteSession(req, res, projectToken, sessionToken) {
+  const project = decodeToken(projectToken);
+  const locator = decodeToken(sessionToken);
+
+  if (!project?.projectPath || !locator?.projectPath) {
+    sendError(res, 'Invalid session locator', 400);
+    return;
+  }
+
+  if (project.projectPath !== locator.projectPath) {
+    sendError(res, 'Session does not belong to the selected project', 400);
+    return;
+  }
+
+  if (locator.draft) {
+    sendJSON(res, { ok: true, source: locator.source, draft: true });
+    return;
+  }
+
+  const storage = resolveSessionStorage(locator);
+  if (!storage) {
+    sendError(res, 'Unsupported session source', 400);
+    return;
+  }
+
+  try {
+    let trashedTo = '';
+    if (storage.filePath) {
+      if (!(await pathExists(storage.filePath))) {
+        sendError(res, 'Session file not found', 404);
+        return;
+      }
+      trashedTo = await movePathToTrash(storage.filePath, storage.source);
+    } else if (storage.dirPath) {
+      if (!(await pathExists(storage.dirPath))) {
+        sendError(res, 'Session directory not found', 404);
+        return;
+      }
+      trashedTo = await movePathToTrash(storage.dirPath, storage.source);
+    }
+
+    if (storage.source === 'claude' && storage.sessionsIndexPath && storage.rawSessionId) {
+      await cleanupClaudeSessionIndex(storage.sessionsIndexPath, storage.rawSessionId);
+    }
+
+    sendJSON(res, {
+      ok: true,
+      source: storage.source,
+      trashedTo,
+    });
+  } catch (err) {
+    sendError(res, 'Failed to delete session: ' + err.message);
+  }
+}
+
 async function handleGetProjects(req, res) {
   try {
     const sessions = await collectAllSessions();
@@ -1389,13 +1568,90 @@ async function handleCreateDraftSession(req, res, projectToken) {
 
   const body = safeJsonParse(raw || '{}') || {};
   const source = typeof body.source === 'string' ? body.source : '';
-  const capabilities = await getInteractionCapabilities();
+  const capabilities = await getInteractionCapabilities(config);
   if (!capabilities[source]?.enabled) {
     sendError(res, `Source unavailable: ${source}`, 400);
     return;
   }
 
   sendJSON(res, buildDraftSession(decoded.projectPath, source));
+}
+
+async function readJsonBody(req) {
+  return await new Promise((resolve, reject) => {
+    const chunks = [];
+    req.on('data', (chunk) => chunks.push(chunk));
+    req.on('end', () => {
+      const raw = Buffer.concat(chunks).toString('utf-8').trim();
+      if (!raw) {
+        resolve({});
+        return;
+      }
+      const parsed = safeJsonParse(raw);
+      if (!parsed || typeof parsed !== 'object') {
+        reject(new Error('Invalid JSON body'));
+        return;
+      }
+      resolve(parsed);
+    });
+    req.on('error', reject);
+  });
+}
+
+async function handleRenameSession(req, res, projectToken, sessionToken) {
+  const project = decodeToken(projectToken);
+  const locator = decodeToken(sessionToken);
+
+  if (!project?.projectPath || !locator?.projectPath) {
+    sendError(res, 'Invalid session locator', 400);
+    return;
+  }
+
+  if (project.projectPath !== locator.projectPath) {
+    sendError(res, 'Session does not belong to the selected project', 400);
+    return;
+  }
+
+  if (locator.draft) {
+    sendError(res, 'Draft sessions are renamed client-side only', 400);
+    return;
+  }
+
+  const key = buildSessionTitleOverrideKey(locator);
+  if (!key) {
+    sendError(res, 'This session cannot be renamed', 400);
+    return;
+  }
+
+  let body = {};
+  try {
+    body = await readJsonBody(req);
+  } catch (err) {
+    sendError(res, err.message || 'Invalid request body', 400);
+    return;
+  }
+
+  await ensureSessionTitleOverridesLoaded();
+  const title = typeof body.title === 'string' ? body.title.trim() : '';
+
+  if (title) {
+    sessionTitleOverrides[key] = title;
+  } else {
+    delete sessionTitleOverrides[key];
+  }
+
+  try {
+    await persistSessionTitleOverrides();
+  } catch (err) {
+    sendError(res, 'Failed to save session title: ' + err.message);
+    return;
+  }
+
+  sendJSON(res, {
+    ok: true,
+    customTitle: title,
+    cleared: !title,
+  });
 }
 
 async function handleRequest(req, res) {
@@ -1430,6 +1686,26 @@ async function handleRequest(req, res) {
   const draftMatch = pathname.match(/^\/api\/draft-session\/([^/]+)$/);
   if (draftMatch && req.method === 'POST') {
     return handleCreateDraftSession(req, res, decodeURIComponent(draftMatch[1]));
+  }
+
+  const renameMatch = pathname.match(/^\/api\/session-title\/([^/]+)\/([^/]+)$/);
+  if (renameMatch && req.method === 'PUT') {
+    return handleRenameSession(
+      req,
+      res,
+      decodeURIComponent(renameMatch[1]),
+      decodeURIComponent(renameMatch[2]),
+    );
+  }
+
+  const deleteMatch = pathname.match(/^\/api\/session\/([^/]+)\/([^/]+)$/);
+  if (deleteMatch && req.method === 'DELETE') {
+    return handleDeleteSession(
+      req,
+      res,
+      decodeURIComponent(deleteMatch[1]),
+      decodeURIComponent(deleteMatch[2]),
+    );
   }
 
   const interactMatch = pathname.match(/^\/api\/interact\/([^/]+)\/([^/]+)$/);

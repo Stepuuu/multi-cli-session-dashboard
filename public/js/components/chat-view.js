@@ -1,6 +1,7 @@
 // chat-view.js — Conversation/message renderer
 
 const TRUNCATE_THRESHOLD = 5000;
+const TOOL_MESSAGE_PREVIEW_LINES = 8;
 
 function escapeAttr(str) {
   return escapeHtml(str);
@@ -70,13 +71,21 @@ function renderChatHeader(session) {
   const model = session.model ? `<span class="chat-tag model">${escapeHtml(session.model)}</span>` : '';
   const sourceLabel = escapeHtml(session.sourceShortLabel || session.sourceLabel || session.source || '?');
   const sourceClass = escapeHtml(session.source || 'unknown');
+  const copyButton = `<button class="chat-header-btn" data-chat-action="copy-to-new-cx">New CX From This</button>`;
+  const renameButton = `<button class="chat-header-btn" data-chat-action="rename-session">Rename</button>`;
 
   header.innerHTML = `
-    <span>${escapeHtml(truncate(session.firstPrompt || 'Session', 50))}</span>
-    <span class="chat-tag source-tag source-${sourceClass}">${sourceLabel}</span>
-    <span class="chat-tag">${dateStr}</span>
-    ${branch}
-    ${model}
+    <div class="chat-header-main">
+      <span class="chat-header-title">${escapeHtml(truncate(session.firstPrompt || 'Session', 80))}</span>
+      <span class="chat-tag source-tag source-${sourceClass}">${sourceLabel}</span>
+      <span class="chat-tag">${dateStr}</span>
+      ${branch}
+      ${model}
+    </div>
+    <div class="chat-header-actions">
+      ${copyButton}
+      ${renameButton}
+    </div>
   `;
 }
 
@@ -259,7 +268,7 @@ function renderStatusMessage(msg, time) {
 
 function renderToolEventMessage(msg, time) {
   const content = typeof msg.content === 'string' ? msg.content : JSON.stringify(msg.content);
-  const bodyHtml = renderTextContent(content);
+  const bodyHtml = renderCollapsibleTextContent(content, TOOL_MESSAGE_PREVIEW_LINES);
 
   return `
     <div class="chat-msg ${messageClass('tool-event-msg', msg)}">
@@ -312,7 +321,7 @@ function renderToolResultMessage(msg, time) {
       }
     }
   } else if (typeof msg.content === 'string') {
-    bodyParts = renderTextContent(msg.content);
+    bodyParts = renderCollapsibleTextContent(msg.content, TOOL_MESSAGE_PREVIEW_LINES);
   }
 
   return `
@@ -390,6 +399,23 @@ function renderTextContent(text) {
   return `<div class="msg-text">${processed}</div>`;
 }
 
+function renderCollapsibleTextContent(text, maxLines = TOOL_MESSAGE_PREVIEW_LINES) {
+  if (!text) return '';
+  const lineCount = String(text).split('\n').length;
+  const processed = formatMarkdownLite(text);
+  if (lineCount <= maxLines) {
+    return `<div class="msg-text">${processed}</div>`;
+  }
+
+  const id = 'collapse-' + Math.random().toString(36).slice(2, 9);
+  return `
+    <div class="msg-text">
+      <div class="collapsible-content" id="${id}" style="--preview-lines:${maxLines}">${processed}</div>
+      <span class="show-more-toggle" onclick="toggleCollapsedBlock('${id}', this)">Expand</span>
+    </div>
+  `;
+}
+
 function renderToolBlock(block) {
   const name = escapeHtml(block.name || 'Tool');
   let inputStr = '';
@@ -446,6 +472,13 @@ function toggleTruncated(id, toggleEl) {
   if (!el) return;
   el.classList.toggle('expanded');
   toggleEl.textContent = el.classList.contains('expanded') ? 'Show less' : 'Show more';
+}
+
+function toggleCollapsedBlock(id, toggleEl) {
+  const el = document.getElementById(id);
+  if (!el) return;
+  el.classList.toggle('expanded');
+  toggleEl.textContent = el.classList.contains('expanded') ? 'Collapse' : 'Expand';
 }
 
 function renderLoadMoreButton(hasMore) {

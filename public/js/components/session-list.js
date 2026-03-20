@@ -1,8 +1,9 @@
 // session-list.js — Session list component
 
 let _onSessionSelectCb = null;
+let _onSessionDeleteCb = null;
 
-function renderSessionList(sessions, selectedId) {
+function renderSessionList(sessions, selectedId, activeSessionIds = new Set()) {
   const container = document.getElementById('session-list');
   if (!sessions || sessions.length === 0) {
     container.innerHTML = '<div class="empty-state">No sessions found</div>';
@@ -11,6 +12,7 @@ function renderSessionList(sessions, selectedId) {
 
   container.innerHTML = sessions.map(s => {
     const isActive = s.sessionId === selectedId;
+    const isBusy = activeSessionIds.has(s.sessionId);
     const prompt = escapeHtml(truncate(s.firstPrompt || '(no prompt)', 60));
     const date = formatRelativeDate(s.modified || s.created);
     const summary = s.summary ? escapeHtml(truncate(s.summary, 80)) : '';
@@ -18,12 +20,15 @@ function renderSessionList(sessions, selectedId) {
     const sourceLabel = escapeHtml(s.sourceShortLabel || s.sourceLabel || s.source || '?');
     const sourceClass = escapeHtml(s.source || 'unknown');
     const draftBadge = s.isDraft ? '<span class="session-draft-badge">DRAFT</span>' : '';
+    const liveBadge = isBusy ? '<span class="session-live-badge">LIVE</span>' : '';
 
     return `
-      <div class="session-item${isActive ? ' active' : ''}" data-id="${escapeHtml(s.sessionId)}">
+      <div class="session-item${isActive ? ' active' : ''}${isBusy ? ' is-busy' : ''}" data-id="${escapeHtml(s.sessionId)}">
+        <button class="session-delete-btn" data-delete-id="${escapeHtml(s.sessionId)}" title="Delete session">Delete</button>
         <div class="session-prompt" title="${escapeHtml(s.firstPrompt || '')}">${prompt}</div>
         <div class="session-meta">
           <span class="session-source-badge source-${sourceClass}" title="${escapeHtml(s.sourceLabel || s.source || '')}">${sourceLabel}</span>
+          ${liveBadge}
           ${draftBadge}
           <span class="session-date">${date}</span>
           <span class="session-msg-count">${s.messageCount} msgs</span>
@@ -40,10 +45,22 @@ function renderSessionList(sessions, selectedId) {
       if (_onSessionSelectCb) _onSessionSelectCb(id);
     });
   });
+
+  container.querySelectorAll('.session-delete-btn').forEach(el => {
+    el.addEventListener('click', (event) => {
+      event.stopPropagation();
+      const id = el.dataset.deleteId;
+      if (_onSessionDeleteCb) _onSessionDeleteCb(id);
+    });
+  });
 }
 
 function onSessionSelect(callback) {
   _onSessionSelectCb = callback;
+}
+
+function onSessionDelete(callback) {
+  _onSessionDeleteCb = callback;
 }
 
 function truncate(str, len) {

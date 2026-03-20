@@ -7,7 +7,7 @@ const PROJECT_SOURCE_LABELS = {
   copilot: 'CP',
 };
 
-function renderProjectList(projects, selectedDir) {
+function renderProjectList(projects, selectedDir, activeProjectIds = new Set()) {
   const container = document.getElementById('project-list');
   if (!projects || projects.length === 0) {
     container.innerHTML = '<div class="empty-state">No projects found</div>';
@@ -16,6 +16,7 @@ function renderProjectList(projects, selectedDir) {
 
   container.innerHTML = projects.map(p => {
     const isActive = p.dirName === selectedDir;
+    const hasLive = activeProjectIds.has(p.dirName);
     const name = escapeHtml(p.name);
     const sourceBadges = (p.sources || []).map((source) => {
       const short = PROJECT_SOURCE_LABELS[source] || source.slice(0, 2).toUpperCase();
@@ -29,10 +30,13 @@ function renderProjectList(projects, selectedDir) {
     }).join('');
 
     return `
-      <div class="project-item${isActive ? ' active' : ''}" data-dir="${escapeHtml(p.dirName)}">
+      <div class="project-item${isActive ? ' active' : ''}${hasLive ? ' has-live' : ''}" data-dir="${escapeHtml(p.dirName)}">
         <div class="project-main">
           <span class="project-name" title="${escapeHtml(p.path)}">${name}</span>
-          ${sourceBadges ? `<div class="project-source-row">${sourceBadges}</div>` : ''}
+          <div class="project-source-row">
+            ${hasLive ? '<span class="project-live-badge">LIVE</span>' : ''}
+            ${sourceBadges}
+          </div>
         </div>
         <span class="project-count">${p.sessionCount}</span>
       </div>
