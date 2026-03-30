@@ -3,9 +3,12 @@ import fsp from 'node:fs/promises';
 import path from 'node:path';
 import { tmpdir } from 'node:os';
 import { randomUUID } from 'node:crypto';
+import { fileURLToPath } from 'node:url';
 
 const MAX_BODY_BYTES = 25 * 1024 * 1024;
 const MAX_IMAGES = 6;
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const CLAUDE_PROVENANCE_FILE = path.join(__dirname, 'data', 'claude-session-provenance.json');
 
 function safeJsonParse(text) {
   try {
@@ -146,6 +149,127 @@ function extensionFromMime(type) {
   return map[type] || '';
 }
 
+function safeJsonObject(text) {
+  const parsed = safeJsonParse(text);
+  return parsed && typeof parsed === 'object' ? parsed : {};
+}
+
+function buildSessionKey(locator) {
+  if (!locator?.source || !locator?.projectPath || !locator?.rawSessionId) return '';
+  return JSON.stringify({
+    source: locator.source,
+    projectPath: locator.projectPath,
+    rawSessionId: locator.rawSessionId,
+  });
+}
+
+function resolveClaudeModelsFile(runtimeConfig) {
+  if (runtimeConfig?.claudeModelsFile) return runtimeConfig.claudeModelsFile;
+  const projectsDir = runtimeConfig?.claudeProjectsDir || '';
+  const normalized = path.resolve(projectsDir);
+  return path.join(path.dirname(path.dirname(normalized)), '.models.json');
+}
+
+async function loadClaudeProfiles(runtimeConfig) {
+  try {
+    const raw = await fsp.readFile(resolveClaudeModelsFile(runtimeConfig), 'utf-8');
+    const parsed = safeJsonObject(raw);
+    return parsed.models && typeof parsed.models === 'object' ? parsed.models : {};
+  } catch {
+    return {};
+  }
+}
+
+async function loadClaudeProvenance() {
+  try {
+    const raw = await fsp.readFile(CLAUDE_PROVENANCE_FILE, 'utf-8');
+    return safeJsonObject(raw);
+  } catch {
+    return {};
+  }
+}
+
+async function persistClaudeProvenance(provenance) {
+  await fsp.mkdir(path.dirname(CLAUDE_PROVENANCE_FILE), { recursive: true });
+  await fsp.writeFile(CLAUDE_PROVENANCE_FILE, JSON.stringify(provenance, null, 2) + '\n', 'utf-8');
+}
+
+async function resolveClaudeLaunchContext(runtimeConfig, locator, sessionMeta = null, profileOverride = '') {
+  const models = await loadClaudeProfiles(runtimeConfig);
+  const provenance = await loadClaudeProvenance();
+  const key = buildSessionKey(locator);
+  const saved = key ? provenance[key] || null : null;
+
+  if (profileOverride && models[profileOverride]?.env) {
+    const env = models[profileOverride].env || {};
+    return {
+      profile: profileOverride,
+      profileLabel: (profileOverride === 'aliyun' ? 'ALIYUN'
+        : profileOverride === 'cliproxy' ? 'CLIPROXY'
+        : profileOverride === 'gpt' ? 'GPT'
+        : profileOverride === 'api3' ? 'API3'
+        : profileOverride === 'fujie' ? 'FUJIE'
+        : profileOverride.toUpperCase()),
+      anthropicModel: env.ANTHROPIC_MODEL || '',
+      baseUrl: env.ANTHROPIC_BASE_URL || '',
+      env,
+      exact: true,
+      source: 'manual-profile',
+    };
+  }
+
+  if (saved?.profile && models[saved.profile]?.env) {
+    const env = models[saved.profile].env || {};
+    return {
+      profile: saved.profile,
+      profileLabel: saved.profileLabel || saved.profile.toUpperCase(),
+      anthropicModel: env.ANTHROPIC_MODEL || saved.anthropicModel || '',
+      baseUrl: env.ANTHROPIC_BASE_URL || saved.baseUrl || '',
+      env,
+      exact: true,
+      source: 'recorded',
+    };
+  }
+
+  const hintedProfile = sessionMeta?.claudeProfile || '';
+  if (hintedProfile && models[hintedProfile]?.env) {
+    const env = models[hintedProfile].env || {};
+    return {
+      profile: hintedProfile,
+      profileLabel: sessionMeta?.claudeProfileLabel || hintedProfile.toUpperCase(),
+      anthropicModel: env.ANTHROPIC_MODEL || sessionMeta?.claudeModel || '',
+      baseUrl: env.ANTHROPIC_BASE_URL || sessionMeta?.claudeBaseUrl || '',
+      env,
+      exact: !!sessionMeta?.claudeProfileExact,
+      source: sessionMeta?.claudeConfigSource || 'hinted',
+    };
+  }
+
+  return {
+    profile: '',
+    profileLabel: '',
+    anthropicModel: sessionMeta?.claudeModel || '',
+    baseUrl: sessionMeta?.claudeBaseUrl || '',
+    env: {},
+    exact: false,
+    source: 'default',
+  };
+}
+
+async function recordClaudeProvenance(locator, launchContext) {
+  const key = buildSessionKey(locator);
+  if (!key || !launchContext) return;
+  const provenance = await loadClaudeProvenance();
+  provenance[key] = {
+    profile: launchContext.profile || '',
+    profileLabel: launchContext.profileLabel || '',
+    anthropicModel: launchContext.anthropicModel || '',
+    baseUrl: launchContext.baseUrl || '',
+    source: launchContext.source || 'dashboard',
+  };
+  await persistClaudeProvenance(provenance);
+}
+
 async function materializeImages(images) {
   if (!Array.isArray(images) || images.length === 0) {
     return { dir: '', files: [] };
@@ -276,9 +400,7 @@ function createCopilotArgs(locator, prompt, uploadDir, runtimeConfig) {
 }
 
 function defaultCwd(locator, runtimeConfig) {
-  return locator.projectPath && locator.projectPath !== '(unknown)'
-    ? locator.projectPath
-    : runtimeConfig.workspaceRoot;
+  return locator.projectPath && locator.projectPath !== '(unknown)' ? locator.projectPath : runtimeConfig.workspaceRoot;
 }
 
 function formatCommandForDisplay(command) {
@@ -549,6 +671,8 @@ export async function handleInteractionRequest(req, res, { project, locator, con
     const body = await readJsonBody(req);
     const text = typeof body.text === 'string' ? body.text : '';
     const images = Array.isArray(body.images) ? body.images : [];
+    const sessionMeta = body.sessionMeta && typeof body.sessionMeta === 'object' ? body.sessionMeta : null;
+    const claudeProfileOverride = typeof body.claudeProfileOverride === 'string' ? body.claudeProfileOverride.trim() : '';
     const { dir: uploadDir, files: imageFiles } = await materializeImages(images);
     const preferredCwd = defaultCwd(locator, config);
     const cwd = (await pathExists(preferredCwd)) ? preferredCwd : config.workspaceRoot;
@@ -610,7 +734,17 @@ export async function handleInteractionRequest(req, res, { project, locator, con
     if (locator.source === 'claude') {
       const prompt = buildPrompt(text, imageFiles, false);
       const args = createClaudeArgs(locator, prompt, uploadDir);
+      const claudeLaunch = await resolveClaudeLaunchContext(config, locator, sessionMeta, claudeProfileOverride);
       sendEvent(res, { type: 'status', message: 'Starting Claude interaction...' });
+      if (claudeLaunch.profileLabel || claudeLaunch.anthropicModel) {
+        const summary = [
+          claudeLaunch.profileLabel ? `profile=${claudeLaunch.profileLabel}` : '',
+          claudeLaunch.anthropicModel ? `model=${claudeLaunch.anthropicModel}` : '',
+        ].filter(Boolean).join(' ');
+        if (summary) {
+          sendEvent(res, { type: 'status', message: `Claude launch context: ${summary}` });
+        }
+      }
       if (imageFiles.length > 0) {
         sendEvent(res, {
           type: 'image_state',
@@ -625,8 +759,12 @@ export async function handleInteractionRequest(req, res, { project, locator, con
       }
       await streamProcess(res, req, config.claudeBin, args, {
         cwd,
+        env: claudeLaunch.env || {},
         parseLine: parseClaudeLine,
       });
+      if (claudeLaunch.profile || claudeLaunch.baseUrl || claudeLaunch.anthropicModel) {
+        await recordClaudeProvenance(locator, claudeLaunch);
+      }
       return;
     }
 

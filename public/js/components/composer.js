@@ -1,6 +1,7 @@
 // composer.js — Interactive prompt composer for selected sessions
 
 let composerCapabilities = null;
+let composerClaudeProfiles = [];
 let composerAttachments = [];
 let composerSelection = { project: null, session: null, sessionMeta: null };
 let composerTransientCounter = 0;
@@ -11,6 +12,8 @@ const composerStatusBySession = new Map();
 const composerTransientMessagesBySession = new Map();
 const composerImageStateBySession = new Map();
 const composerControllersBySession = new Map();
+const composerClaudeProfileOverrideBySession = new Map();
+const composerLatestInteractionTokenBySession = new Map();
 
 function composerEl(id) {
   return document.getElementById(id);
@@ -27,6 +30,64 @@ function currentSessionMeta() {
 function currentCapability() {
   const source = composerSelection.sessionMeta && composerSelection.sessionMeta.source;
   return source && composerCapabilities ? composerCapabilities[source] : null;
+}
+
+function currentClaudeProfileOverride() {
+  return composerClaudeProfileOverrideBySession.get(currentSessionId()) || '';
+}
+
+function effectiveClaudeProfileHint() {
+  const meta = currentSessionMeta();
+  if (!meta || meta.source !== 'claude') return '';
+  return currentClaudeProfileOverride() || meta.claudeProfile || '';
+}
+
+function renderClaudeProfileSelector() {
+  const container = composerEl('composer-claude-profile');
+  if (!container) return;
+
+  const meta = currentSessionMeta();
+  if (!meta || meta.source !== 'claude' || !composerClaudeProfiles.length) {
+    container.innerHTML = '';
+    return;
+  }
+
+  const effectiveProfile = effectiveClaudeProfileHint();
+  const current = effectiveProfile || '__auto__';
+  const currentSource = meta.claudeConfigSource || 'unknown';
+  const currentLabel = meta.claudeProfileLabel || (meta.claudeModel ? meta.claudeModel : 'AUTO');
+  const currentHint = meta.claudeProfileHint || '';
+
+  const options = [
+    '<option value="__auto__">AUTO</option>',
+    ...composerClaudeProfiles.map((profile) => (
+      `<option value="${escapeHtml(profile.name)}"${profile.name === current ? ' selected' : ''}>${escapeHtml(profile.label)}${profile.anthropicModel ? ` · ${escapeHtml(profile.anthropicModel)}` : ''}</option>`
+    )),
+  ].join('');
+
+  container.innerHTML = `
+    <div class="composer-profile-row">
+      <span class="composer-profile-label">CLAUDE PROFILE</span>
+      <select id="composer-claude-profile-select" class="composer-profile-select">
+        ${options}
+      </select>
+      <span class="composer-profile-note">using: ${escapeHtml(currentLabel)}${currentHint ? ` (${escapeHtml(currentHint)})` : ''} · ${escapeHtml(currentSource)}</span>
+    </div>
+  `;
+
+  const select = composerEl('composer-claude-profile-select');
+  if (select) {
+    select.value = current;
+    select.addEventListener('change', () => {
+      const value = select.value === '__auto__' ? '' : select.value;
+      if (value) {
+        composerClaudeProfileOverrideBySession.set(currentSessionId(), value);
+      } else {
+        composerClaudeProfileOverrideBySession.delete(currentSessionId());
+      }
+      renderComposer();
+    });
+  }
 }
 
 function imageSummaryText(selectedCount, decodedCount, transport) {
@@ -272,6 +333,7 @@ function renderComposer() {
   }
 
   renderAttachments();
+  renderClaudeProfileSelector();
   renderImageStateBar();
   autoResizeComposer();
 }
@@ -472,7 +534,10 @@ function stopComposerForSession(sessionId, options = {}) {
   return true;
 }
 
-async function finalizeComposerHydration(projectToken, sessionId, requestState) {
+async function finalizeComposerHydration(projectToken, sessionId, requestState, interactionToken) {
+  if (composerLatestInteractionTokenBySession.get(sessionId) !== interactionToken) {
+    return;
+  }
   if (typeof window.__dashboardFinalizeInteractionHydration !== 'function') {
     return;
   }
@@ -508,12 +573,14 @@ async function submitInteraction({
   const outboundImages = Array.isArray(images) ? images.map((attachment) => ({ ...attachment })) : [];
   if (!normalizedText.trim() && outboundImages.length === 0) return;
 
+  const interactionToken = `${sessionId}:${Date.now()}:${Math.random().toString(36).slice(2, 8)}`;
+  composerLatestInteractionTokenBySession.set(sessionId, interactionToken);
   composerSendingSessions.add(sessionId);
   if (typeof window.__dashboardSetSessionActivityState === 'function') {
     window.__dashboardSetSessionActivityState(sessionId, true, projectToken);
   }
   composerImageStateBySession.delete(sessionId);
-  resetTransientTimelineForSession(sessionId);
+  markAllTransientNotLive(sessionId);
   pushTransientMessageForSession(sessionId, sessionMeta, {
     type: 'user',
     content: formatOutboundUserContent(outboundText, outboundImages.length),
@@ -540,6 +607,8 @@ async function submitInteraction({
         body: JSON.stringify({
           text: normalizedText,
           images: outboundImages,
+          sessionMeta,
+          claudeProfileOverride: sessionMeta?.source === 'claude' ? currentClaudeProfileOverride() : '',
         }),
       }
     );
@@ -564,11 +633,11 @@ async function submitInteraction({
     consumeNdjsonChunk(buffer, handleEvent);
 
     setTimeout(() => {
-      finalizeComposerHydration(projectToken, sessionId, requestState);
+      finalizeComposerHydration(projectToken, sessionId, requestState, interactionToken);
     }, 800);
   } catch (err) {
     if (err.name === 'AbortError') {
-      await finalizeComposerHydration(projectToken, sessionId, requestState);
+      await finalizeComposerHydration(projectToken, sessionId, requestState, interactionToken);
       return;
     }
     setComposerStatusForSession(sessionId, err.message || 'Interaction failed.', true);
@@ -577,7 +646,7 @@ async function submitInteraction({
       window.__dashboardMarkSessionNeedsHydration(sessionId);
     }
     setTimeout(() => {
-      finalizeComposerHydration(projectToken, sessionId, requestState);
+      finalizeComposerHydration(projectToken, sessionId, requestState, interactionToken);
     }, 600);
   } finally {
     composerControllersBySession.delete(sessionId);
@@ -590,7 +659,12 @@ async function submitInteraction({
 }
 
 async function submitComposer() {
-  const sessionId = currentSessionId();
+  let sessionId = currentSessionId();
+  if (typeof window.__dashboardPrepareSessionForNewInteraction === 'function') {
+    await window.__dashboardPrepareSessionForNewInteraction(sessionId);
+  }
+
+  sessionId = currentSessionId();
   const sessionMeta = currentSessionMeta();
   const projectToken = composerSelection.project;
   const sessionToken = composerSelection.session;
@@ -629,6 +703,16 @@ function initComposer() {
     })
     .catch((err) => {
       setComposerStatusForSession(currentSessionId(), 'Failed to load interaction capabilities.', true);
+      console.error(err);
+    });
+
+  fetch('/api/claude-profiles')
+    .then((res) => res.json())
+    .then((data) => {
+      composerClaudeProfiles = Array.isArray(data) ? data : [];
+      renderComposer();
+    })
+    .catch((err) => {
       console.error(err);
     });
 

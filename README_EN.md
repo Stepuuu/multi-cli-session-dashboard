@@ -21,12 +21,14 @@ This repository is the generalized open-source version of a production internal 
   - GitHub Copilot CLI
 - Group sessions by workspace / project path
 - Show source badges in both project and session lists
+- Pin sessions into a compact workspace strip for fast switching across projects
 - Render markdown-like assistant output more cleanly than raw JSONL
 - Clarify cross-day resumed sessions with date separators
 - Continue existing sessions from the browser
 - Create new draft sessions from a selected project
 - Stream live status, tool events, and assistant output into the chat timeline
 - Paste or upload images from the browser
+- Use metadata caching and digest-based polling to reduce unnecessary rescans
 
 ## Architecture
 
@@ -84,6 +86,7 @@ Then edit the paths:
   "port": 3456,
   "workspaceRoot": "/path/to/your/workspace",
   "claudeProjectsDir": "/home/your-user/.claude/projects",
+  "claudeModelsFile": "/home/your-user/.models.json",
   "codexSessionsDir": "/home/your-user/.codex/sessions",
   "copilotSessionStateDir": "/home/your-user/.copilot/session-state",
   "codexBin": "codex",
@@ -140,6 +143,7 @@ This makes browser-side image input practical even when the real tool is running
 
 - Add authentication
 - Add configurable source adapters
+- Add split-view / multi-session reading mode
 - Add MCP / tool inspection cards
 - Add export / archive support
 - Add search across sessions

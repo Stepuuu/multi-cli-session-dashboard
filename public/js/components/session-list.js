@@ -2,8 +2,9 @@
 
 let _onSessionSelectCb = null;
 let _onSessionDeleteCb = null;
+let _onSessionPinCb = null;
 
-function renderSessionList(sessions, selectedId, activeSessionIds = new Set()) {
+function renderSessionList(sessions, selectedId, activeSessionIds = new Set(), pinnedSessionIds = new Set()) {
   const container = document.getElementById('session-list');
   if (!sessions || sessions.length === 0) {
     container.innerHTML = '<div class="empty-state">No sessions found</div>';
@@ -21,13 +22,20 @@ function renderSessionList(sessions, selectedId, activeSessionIds = new Set()) {
     const sourceClass = escapeHtml(s.source || 'unknown');
     const draftBadge = s.isDraft ? '<span class="session-draft-badge">DRAFT</span>' : '';
     const liveBadge = isBusy ? '<span class="session-live-badge">LIVE</span>' : '';
+    const pinLabel = pinnedSessionIds.has(s.sessionId) ? 'Unpin' : 'Pin';
+    const pinClass = pinnedSessionIds.has(s.sessionId) ? ' is-pinned' : '';
+    const claudeConfigBadge = s.source === 'claude' && s.claudeProfileLabel
+      ? `<span class="session-config-badge" title="${escapeHtml(s.claudeConfigSource || '')}${s.claudeProfileHint ? `: ${escapeHtml(s.claudeProfileHint)}` : ''}">${escapeHtml(s.claudeProfileLabel)}</span>`
+      : '';
 
     return `
       <div class="session-item${isActive ? ' active' : ''}${isBusy ? ' is-busy' : ''}" data-id="${escapeHtml(s.sessionId)}">
+        <button class="session-pin-btn${pinClass}" data-pin-id="${escapeHtml(s.sessionId)}" title="${pinLabel} session">${pinLabel}</button>
         <button class="session-delete-btn" data-delete-id="${escapeHtml(s.sessionId)}" title="Delete session">Delete</button>
         <div class="session-prompt" title="${escapeHtml(s.firstPrompt || '')}">${prompt}</div>
         <div class="session-meta">
           <span class="session-source-badge source-${sourceClass}" title="${escapeHtml(s.sourceLabel || s.source || '')}">${sourceLabel}</span>
+          ${claudeConfigBadge}
           ${liveBadge}
           ${draftBadge}
           <span class="session-date">${date}</span>
@@ -53,6 +61,14 @@ function renderSessionList(sessions, selectedId, activeSessionIds = new Set()) {
       if (_onSessionDeleteCb) _onSessionDeleteCb(id);
     });
   });
+
+  container.querySelectorAll('.session-pin-btn').forEach(el => {
+    el.addEventListener('click', (event) => {
+      event.stopPropagation();
+      const id = el.dataset.pinId;
+      if (_onSessionPinCb) _onSessionPinCb(id);
+    });
+  });
 }
 
 function onSessionSelect(callback) {
@@ -61,6 +77,10 @@ function onSessionSelect(callback) {
 
 function onSessionDelete(callback) {
   _onSessionDeleteCb = callback;
+}
+
+function onSessionPin(callback) {
+  _onSessionPinCb = callback;
 }
 
 function truncate(str, len) {

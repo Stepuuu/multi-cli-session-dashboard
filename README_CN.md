@@ -26,12 +26,14 @@
   - GitHub Copilot CLI
 - 按工作区 / 项目路径聚合会话
 - 在项目列表和会话列表里显示来源标记
+- 可以把常用 session 固定到紧凑 workspace strip，方便跨项目快速切换
 - 把原始 JSONL 文本整理成更接近 CLI 的显示效果
 - 对跨天 resume 的会话增加日期分隔，减少“时间乱跳”的错觉
 - 在浏览器里继续已有 session
 - 在选中项目后创建新的 draft session
 - 把状态、工具事件、回复流式插入聊天记录
 - 支持粘贴/上传图片
+- 使用元数据缓存和 digest 轮询，减少不必要的重复扫描
 
 ## 架构
 
@@ -89,6 +91,7 @@ cp config.example.json config.json
   "port": 3456,
   "workspaceRoot": "/path/to/your/workspace",
   "claudeProjectsDir": "/home/your-user/.claude/projects",
+  "claudeModelsFile": "/home/your-user/.models.json",
   "codexSessionsDir": "/home/your-user/.codex/sessions",
   "copilotSessionStateDir": "/home/your-user/.copilot/session-state",
   "codexBin": "codex",
@@ -147,6 +150,7 @@ http://localhost:3456
 
 - 增加登录鉴权
 - 支持更多 CLI / Agent 工具
+- 增加 split view / 多会话同时阅读模式
 - 更好的工具事件卡片
 - 会话全文检索
 - 导出和归档功能

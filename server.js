@@ -33,8 +33,21 @@ const MIME_TYPES = {
 
 const TRASH_ROOT = '/tmp/session-dashboard-trash';
 const SESSION_TITLE_OVERRIDES_FILE = path.join(__dirname, 'data', 'session-title-overrides.json');
+const CLAUDE_PROVENANCE_FILE = path.join(__dirname, 'data', 'claude-session-provenance.json');
+const SESSION_METADATA_CACHE_FILE = path.join(__dirname, 'data', 'session-metadata-cache.json');
+const SESSION_SNAPSHOT_TTL_MS = 1500;
+const MESSAGE_CACHE_LIMIT = 32;
 let sessionTitleOverridesLoaded = false;
 let sessionTitleOverrides = {};
+let claudeProvenanceLoaded = false;
+let claudeSessionProvenance = {};
+let claudeProfilesLoaded = false;
+let claudeProfilesCache = null;
+let sessionMetadataCacheLoaded = false;
+let sessionMetadataCacheDirty = false;
+const sessionMetadataCache = new Map();
+let sessionsSnapshotCache = null;
+const messageParseCache = new Map();
 
 function sendJSON(res, data, status = 200) {
   const body = JSON.stringify(data);
@@ -71,6 +84,185 @@ async function persistSessionTitleOverrides() {
     JSON.stringify(sessionTitleOverrides, null, 2) + '\n',
     'utf-8',
   );
+}
+
+async function ensureSessionMetadataCacheLoaded() {
+  if (sessionMetadataCacheLoaded) return;
+  sessionMetadataCacheLoaded = true;
+
+  try {
+    const raw = await fsp.readFile(SESSION_METADATA_CACHE_FILE, 'utf-8');
+    const parsed = JSON.parse(raw);
+    const entries = parsed?.entries && typeof parsed.entries === 'object' ? parsed.entries : {};
+    for (const [key, value] of Object.entries(entries)) {
+      if (!value || typeof value !== 'object') continue;
+      sessionMetadataCache.set(key, value);
+    }
+  } catch {
+    sessionMetadataCache.clear();
+  }
+}
+
+async function persistSessionMetadataCache() {
+  if (!sessionMetadataCacheDirty) return;
+  sessionMetadataCacheDirty = false;
+
+  const payload = {
+    savedAt: new Date().toISOString(),
+    entries: Object.fromEntries(sessionMetadataCache.entries()),
+  };
+
+  await fsp.mkdir(path.dirname(SESSION_METADATA_CACHE_FILE), { recursive: true });
+  await fsp.writeFile(
+    SESSION_METADATA_CACHE_FILE,
+    JSON.stringify(payload, null, 2) + '\n',
+    'utf-8',
+  );
+}
+
+function invalidateSessionsSnapshotCache() {
+  sessionsSnapshotCache = null;
+}
+
+function buildSessionMetadataCacheKey(source, filePath) {
+  return `${source}:${filePath}`;
+}
+
+function buildFileFingerprint(stat, extra = '') {
+  const extraPart = extra ? `:${extra}` : '';
+  return `${Math.floor(stat.mtimeMs)}:${stat.size}${extraPart}`;
+}
+
+function getCachedSessionMetadata(cacheKey, fingerprint) {
+  const cached = sessionMetadataCache.get(cacheKey);
+  if (!cached || cached.fingerprint !== fingerprint) return null;
+  return cached.data || null;
+}
+
+function setCachedSessionMetadata(cacheKey, fingerprint, data) {
+  sessionMetadataCache.set(cacheKey, {
+    fingerprint,
+    data,
+  });
+  sessionMetadataCacheDirty = true;
+}
+
+function getMessageCache(cacheKey, fingerprint) {
+  const cached = messageParseCache.get(cacheKey);
+  if (!cached || cached.fingerprint !== fingerprint) return null;
+  messageParseCache.delete(cacheKey);
+  messageParseCache.set(cacheKey, cached);
+  return cached.messages;
+}
+
+function setMessageCache(cacheKey, fingerprint, messages) {
+  if (messageParseCache.has(cacheKey)) {
+    messageParseCache.delete(cacheKey);
+  }
+  messageParseCache.set(cacheKey, { fingerprint, messages });
+
+  while (messageParseCache.size > MESSAGE_CACHE_LIMIT) {
+    const firstKey = messageParseCache.keys().next().value;
+    if (!firstKey) break;
+    messageParseCache.delete(firstKey);
+  }
+}
+
+function invalidateMessageCache(cacheKey) {
+  if (!cacheKey) return;
+  messageParseCache.delete(cacheKey);
+}
+
+function buildProjectDigest(projects) {
+  return projects.map((project) => ({
+    dirName: project.dirName,
+    sessionCount: project.sessionCount,
+    latestModified: project.latestModified || 0,
+    sourceCounts: project.sourceCounts || {},
+  }));
+}
+
+function buildSessionDigest(sessions) {
+  return sessions.map((session) => ({
+    sessionId: session.sessionId,
+    source: session.source,
+    rawSessionId: session.rawSessionId || '',
+    modified: session.modified || '',
+    messageCount: session.messageCount || 0,
+    model: session.model || '',
+    title: session.customTitle || session.firstPrompt || '',
+  }));
+}
+
+async function ensureClaudeProvenanceLoaded() {
+  if (claudeProvenanceLoaded) return;
+  claudeProvenanceLoaded = true;
+  try {
+    const raw = await fsp.readFile(CLAUDE_PROVENANCE_FILE, 'utf-8');
+    const parsed = JSON.parse(raw);
+    claudeSessionProvenance = parsed && typeof parsed === 'object' ? parsed : {};
+  } catch {
+    claudeSessionProvenance = {};
+  }
+}
+
+function parseClaudeModelsJson(raw) {
+  const parsed = safeJsonParse(raw);
+  const models = parsed?.models && typeof parsed.models === 'object' ? parsed.models : {};
+  const byName = {};
+  const byModel = new Map();
+
+  for (const [name, entry] of Object.entries(models)) {
+    const env = entry?.env && typeof entry.env === 'object' ? entry.env : {};
+    const anthropicModel = env.ANTHROPIC_MODEL || '';
+    const baseUrl = env.ANTHROPIC_BASE_URL || '';
+    const label = name === 'aliyun' ? 'ALIYUN'
+      : name === 'cliproxy' ? 'CLIPROXY'
+      : name === 'gpt' ? 'GPT'
+      : name === 'deepseek' ? 'DEEPSEEK'
+      : name === 'openrouter' ? 'OPENROUTER'
+      : name === 'sii' ? 'SII'
+      : name === 'fujie' ? 'FUJIE'
+      : name.toUpperCase();
+    byName[name] = {
+      name,
+      label,
+      anthropicModel,
+      baseUrl,
+      description: entry?.description || '',
+    };
+    if (anthropicModel) {
+      if (!byModel.has(anthropicModel)) byModel.set(anthropicModel, []);
+      byModel.get(anthropicModel).push(byName[name]);
+    }
+  }
+
+  return { byName, byModel };
+}
+
+function preferredClaudeProfileForModel(model) {
+  const value = (model || '').toLowerCase();
+  if (!value) return '';
+  if (value.includes('kimi')) return 'aliyun';
+  if (value.includes('gpt-5.4')) return 'gpt';
+  if (value.includes('deepseek')) return 'deepseek';
+  if (value.includes('claude-sonnet') || value.includes('claude-opus') || value.includes('claude-haiku')) {
+    return 'cliproxy';
+  }
+  return '';
+}
+
+async function ensureClaudeProfilesLoaded() {
+  if (claudeProfilesLoaded) return;
+  claudeProfilesLoaded = true;
+  try {
+    const realProjectsDir = await fsp.realpath(config.claudeProjectsDir);
+    const modelsFile = path.join(path.dirname(path.dirname(realProjectsDir)), '.models.json');
+    const raw = await fsp.readFile(modelsFile, 'utf-8');
+    claudeProfilesCache = parseClaudeModelsJson(raw);
+  } catch {
+    claudeProfilesCache = { byName: {}, byModel: new Map() };
+  }
 }
 
 async function serveStatic(req, res) {
@@ -138,6 +330,94 @@ function applySessionTitleOverride(session) {
     defaultFirstPrompt,
     customTitle,
     firstPrompt: customTitle || defaultFirstPrompt,
+  };
+}
+
+function decorateClaudeSessionConfig(session) {
+  const key = buildSessionTitleOverrideKey(session);
+  const saved = key ? claudeSessionProvenance[key] || null : null;
+
+  if (saved) {
+    return {
+      ...session,
+      claudeProfile: saved.profile || '',
+      claudeProfileLabel: saved.profileLabel || (saved.profile ? saved.profile.toUpperCase() : ''),
+      claudeProfileHint: saved.profile || '',
+      claudeProfileExact: true,
+      claudeBaseUrl: saved.baseUrl || '',
+      claudeModel: saved.anthropicModel || session.model || '',
+      claudeConfigSource: saved.source || 'recorded',
+    };
+  }
+
+  const model = session.model || '';
+  const candidates = model ? (claudeProfilesCache?.byModel.get(model) || []) : [];
+  if (candidates.length === 1) {
+    const candidate = candidates[0];
+    return {
+      ...session,
+      claudeProfile: candidate.name,
+      claudeProfileLabel: candidate.label,
+      claudeProfileHint: candidate.name,
+      claudeProfileExact: false,
+      claudeBaseUrl: candidate.baseUrl,
+      claudeModel: candidate.anthropicModel || model,
+      claudeConfigSource: 'inferred-model',
+    };
+  }
+
+  if (candidates.length > 1) {
+    const preferred = preferredClaudeProfileForModel(model);
+    const preferredCandidate = preferred ? candidates.find((candidate) => candidate.name === preferred) : null;
+    if (preferredCandidate) {
+      return {
+        ...session,
+        claudeProfile: preferredCandidate.name,
+        claudeProfileLabel: preferredCandidate.label,
+        claudeProfileHint: preferredCandidate.name,
+        claudeProfileExact: false,
+        claudeBaseUrl: preferredCandidate.baseUrl,
+        claudeModel: preferredCandidate.anthropicModel || model,
+        claudeConfigSource: 'default-model-family',
+      };
+    }
+
+    return {
+      ...session,
+      claudeProfile: '',
+      claudeProfileLabel: 'MULTI',
+      claudeProfileHint: candidates.map((c) => c.label).join('/'),
+      claudeProfileExact: false,
+      claudeBaseUrl: '',
+      claudeModel: model,
+      claudeConfigSource: 'ambiguous-model',
+    };
+  }
+
+  const preferred = preferredClaudeProfileForModel(model);
+  const preferredByName = preferred ? claudeProfilesCache?.byName?.[preferred] : null;
+  if (preferredByName) {
+    return {
+      ...session,
+      claudeProfile: preferredByName.name,
+      claudeProfileLabel: preferredByName.label,
+      claudeProfileHint: preferredByName.name,
+      claudeProfileExact: false,
+      claudeBaseUrl: preferredByName.baseUrl,
+      claudeModel: preferredByName.anthropicModel || model,
+      claudeConfigSource: 'default-model-family',
+    };
+  }
+
+  return {
+    ...session,
+    claudeProfile: '',
+    claudeProfileLabel: model ? 'MODEL' : '',
+    claudeProfileHint: model || '',
+    claudeProfileExact: false,
+    claudeBaseUrl: '',
+    claudeModel: model,
+    claudeConfigSource: model ? 'model-only' : 'unknown',
   };
 }
 
@@ -395,6 +675,7 @@ async function scanClaudeMetadata(filePath) {
     let firstPrompt = '';
     let messageCount = 0;
     let gitBranch = '';
+    let model = '';
 
     rl.on('line', (line) => {
       const obj = safeJsonParse(line);
@@ -424,10 +705,14 @@ async function scanClaudeMetadata(filePath) {
         }
       }
 
+      if (obj.type === 'assistant' && obj.message?.model && !model) {
+        model = obj.message.model;
+      }
+
       messageCount++;
     });
 
-    rl.on('close', () => resolve({ firstPrompt, messageCount, gitBranch }));
+    rl.on('close', () => resolve({ firstPrompt, messageCount, gitBranch, model }));
     rl.on('error', reject);
   });
 }
@@ -473,12 +758,31 @@ async function collectClaudeSessions() {
         continue;
       }
 
+      const indexFingerprint = indexEntry
+        ? JSON.stringify([
+            indexEntry.firstPrompt || '',
+            indexEntry.summary || '',
+            indexEntry.messageCount || 0,
+            indexEntry.created || '',
+            indexEntry.modified || '',
+            indexEntry.gitBranch || '',
+          ])
+        : '';
+      const cacheKey = buildSessionMetadataCacheKey('claude', filePath);
+      const fingerprint = buildFileFingerprint(fileStat, indexFingerprint);
+      const cached = getCachedSessionMetadata(cacheKey, fingerprint);
+      if (cached) {
+        sessions.push(cached);
+        continue;
+      }
+
       let firstPrompt = '';
       let summary = '';
       let messageCount = 0;
       let created = fileStat.birthtime.toISOString();
       let modified = fileStat.mtime.toISOString();
       let gitBranch = '';
+      let model = '';
 
       if (indexEntry) {
         firstPrompt = cleanClaudePromptText(indexEntry.firstPrompt || '');
@@ -492,6 +796,7 @@ async function collectClaudeSessions() {
         firstPrompt = scanned.firstPrompt;
         messageCount = scanned.messageCount;
         gitBranch = scanned.gitBranch;
+        model = scanned.model || '';
       }
 
       if (!firstPrompt) {
@@ -499,9 +804,10 @@ async function collectClaudeSessions() {
         firstPrompt = rescanned.firstPrompt || firstPrompt;
         if (!messageCount) messageCount = rescanned.messageCount;
         if (!gitBranch) gitBranch = rescanned.gitBranch;
+        if (!model) model = rescanned.model || '';
       }
 
-      sessions.push({
+      const session = {
         source: 'claude',
         sourceLabel: SOURCE_META.claude.label,
         sourceShortLabel: SOURCE_META.claude.shortLabel,
@@ -514,14 +820,17 @@ async function collectClaudeSessions() {
         created,
         modified,
         gitBranch,
-        model: '',
+        model,
         sessionId: encodeToken({
           source: 'claude',
           projectPath,
           projectDir: dirName,
           rawSessionId,
         }),
-      });
+      };
+
+      setCachedSessionMetadata(cacheKey, fingerprint, session);
+      sessions.push(session);
     }
   }
 
@@ -609,11 +918,19 @@ async function collectCodexSessions() {
       continue;
     }
 
+    const cacheKey = buildSessionMetadataCacheKey('codex', filePath);
+    const fingerprint = buildFileFingerprint(fileStat);
+    const cached = getCachedSessionMetadata(cacheKey, fingerprint);
+    if (cached) {
+      sessions.push(cached);
+      continue;
+    }
+
     const metadata = await scanCodexMetadata(filePath);
     const relativePath = path.relative(config.codexSessionsDir, filePath);
     const projectPath = normalizeProjectPath(metadata.projectPath);
 
-    sessions.push({
+    const session = {
       source: 'codex',
       sourceLabel: SOURCE_META.codex.label,
       sourceShortLabel: SOURCE_META.codex.shortLabel,
@@ -633,7 +950,10 @@ async function collectCodexSessions() {
         relativePath,
         rawSessionId: metadata.rawSessionId,
       }),
-    });
+    };
+
+    setCachedSessionMetadata(cacheKey, fingerprint, session);
+    sessions.push(session);
   }
 
   return sessions;
@@ -736,10 +1056,24 @@ async function collectCopilotSessions() {
       continue;
     }
 
+    const workspaceFingerprint = JSON.stringify([
+      workspaceInfo.cwd || '',
+      workspaceInfo.summary || '',
+      workspaceInfo.created_at || '',
+      workspaceInfo.updated_at || '',
+    ]);
+    const cacheKey = buildSessionMetadataCacheKey('copilot', eventsPath);
+    const fingerprint = buildFileFingerprint(fileStat, workspaceFingerprint);
+    const cached = getCachedSessionMetadata(cacheKey, fingerprint);
+    if (cached) {
+      sessions.push(cached);
+      continue;
+    }
+
     const metadata = await scanCopilotMetadata(eventsPath, workspaceInfo);
     const projectPath = normalizeProjectPath(metadata.projectPath);
 
-    sessions.push({
+    const session = {
       source: 'copilot',
       sourceLabel: SOURCE_META.copilot.label,
       sourceShortLabel: SOURCE_META.copilot.shortLabel,
@@ -759,7 +1093,10 @@ async function collectCopilotSessions() {
         sessionDir,
         rawSessionId: metadata.rawSessionId,
       }),
-    });
+    };
+
+    setCachedSessionMetadata(cacheKey, fingerprint, session);
+    sessions.push(session);
   }
 
   return sessions;
@@ -767,6 +1104,9 @@ async function collectCopilotSessions() {
 
 async function collectAllSessions() {
   await ensureSessionTitleOverridesLoaded();
+  await ensureClaudeProvenanceLoaded();
+  await ensureClaudeProfilesLoaded();
+  await ensureSessionMetadataCacheLoaded();
 
   const [claude, codex, copilot] = await Promise.all([
     collectClaudeSessions(),
@@ -774,7 +1114,67 @@ async function collectAllSessions() {
     collectCopilotSessions(),
   ]);
 
-  return [...claude, ...codex, ...copilot].map(applySessionTitleOverride);
+  return [
+    ...claude.map(decorateClaudeSessionConfig),
+    ...codex,
+    ...copilot,
+  ].map(applySessionTitleOverride);
+}
+
+async function buildSessionsSnapshot() {
+  const sessions = await collectAllSessions();
+  const projects = buildProjectRows(sessions);
+  const sessionsByProject = new Map();
+  const sessionsDigestByProject = new Map();
+
+  for (const project of projects) {
+    const projectSessions = sessions
+      .filter((session) => normalizeProjectPath(session.projectPath) === project.path)
+      .sort((a, b) => {
+        const dateA = a.modified ? new Date(a.modified).getTime() : 0;
+        const dateB = b.modified ? new Date(b.modified).getTime() : 0;
+        return dateB - dateA;
+      });
+    sessionsByProject.set(project.path, projectSessions);
+    sessionsDigestByProject.set(project.path, buildSessionDigest(projectSessions));
+  }
+
+  const snapshot = {
+    builtAt: Date.now(),
+    sessions,
+    projects,
+    projectsDigest: buildProjectDigest(projects),
+    sessionsByProject,
+    sessionsDigestByProject,
+  };
+
+  sessionsSnapshotCache = snapshot;
+  await persistSessionMetadataCache();
+  return snapshot;
+}
+
+async function getSessionsSnapshot(force = false) {
+  if (
+    !force &&
+    sessionsSnapshotCache &&
+    Date.now() - sessionsSnapshotCache.builtAt < SESSION_SNAPSHOT_TTL_MS
+  ) {
+    return sessionsSnapshotCache;
+  }
+
+  return buildSessionsSnapshot();
+}
+
+async function handleGetClaudeProfiles(req, res) {
+  await ensureClaudeProfilesLoaded();
+  const profiles = Object.values(claudeProfilesCache?.byName || {}).map((profile) => ({
+    name: profile.name,
+    label: profile.label,
+    anthropicModel: profile.anthropicModel,
+    baseUrl: profile.baseUrl,
+    description: profile.description,
+  }));
+  sendJSON(res, profiles);
 }
 
 function buildProjectRows(sessions) {
@@ -1348,26 +1748,35 @@ async function parseCopilotMessages(eventsPath) {
 async function loadMessagesForLocator(locator) {
   if (!locator || !locator.source) return [];
 
+  const storage = resolveSessionStorage(locator);
+  const filePath = storage?.filePath;
+  if (!filePath) return [];
+
+  let stat;
+  try {
+    stat = await fsp.stat(filePath);
+  } catch {
+    return [];
+  }
+
+  const cacheKey = buildSessionMetadataCacheKey(`${locator.source}-messages`, filePath);
+  const fingerprint = buildFileFingerprint(stat);
+  const cached = getMessageCache(cacheKey, fingerprint);
+  if (cached) {
+    return cached;
+  }
+
+  let messages = [];
   if (locator.source === 'claude') {
-    const filePath = path.join(
-      config.claudeProjectsDir,
-      locator.projectDir,
-      `${locator.rawSessionId}.jsonl`
-    );
-    return parseClaudeMessages(filePath);
+    messages = await parseClaudeMessages(filePath);
+  } else if (locator.source === 'codex') {
+    messages = await parseCodexMessages(filePath);
+  } else if (locator.source === 'copilot') {
+    messages = await parseCopilotMessages(filePath);
   }
 
-  if (locator.source === 'codex') {
-    const filePath = path.join(config.codexSessionsDir, locator.relativePath);
-    return parseCodexMessages(filePath);
-  }
-
-  if (locator.source === 'copilot') {
-    const filePath = path.join(config.copilotSessionStateDir, locator.sessionDir, 'events.jsonl');
-    return parseCopilotMessages(filePath);
-  }
-
-  return [];
+  setMessageCache(cacheKey, fingerprint, messages);
+  return messages;
 }
 
 function resolveSessionStorage(locator) {
@@ -1401,6 +1810,7 @@ function resolveSessionStorage(locator) {
     return {
       source: 'copilot',
       dirPath: path.join(config.copilotSessionStateDir, locator.sessionDir),
+      filePath: path.join(config.copilotSessionStateDir, locator.sessionDir, 'events.jsonl'),
     };
   }
 
@@ -1464,6 +1874,14 @@ async function handleDeleteSession(req, res, projectToken, sessionToken) {
       await cleanupClaudeSessionIndex(storage.sessionsIndexPath, storage.rawSessionId);
     }
 
+    if (storage.filePath) {
+      sessionMetadataCache.delete(buildSessionMetadataCacheKey(storage.source, storage.filePath));
+      invalidateMessageCache(buildSessionMetadataCacheKey(`${storage.source}-messages`, storage.filePath));
+      sessionMetadataCacheDirty = true;
+    }
+    invalidateSessionsSnapshotCache();
+    await persistSessionMetadataCache();
+
     sendJSON(res, {
       ok: true,
       source: storage.source,
@@ -1476,11 +1894,19 @@ async function handleDeleteSession(req, res, projectToken, sessionToken) {
 
 async function handleGetProjects(req, res) {
   try {
-    const sessions = await collectAllSessions();
-    const projects = buildProjectRows(sessions);
-    sendJSON(res, projects);
+    const snapshot = await getSessionsSnapshot();
+    sendJSON(res, snapshot.projects);
   } catch (err) {
     sendError(res, 'Failed to build project list: ' + err.message);
+  }
+}
+
+async function handleGetProjectsDigest(req, res) {
+  try {
+    const snapshot = await getSessionsSnapshot();
+    sendJSON(res, snapshot.projectsDigest);
+  } catch (err) {
+    sendError(res, 'Failed to build project digest: ' + err.message);
   }
 }
 
@@ -1492,17 +1918,27 @@ async function handleGetSessions(req, res, projectToken) {
   }
 
   try {
-    const sessions = (await collectAllSessions())
-      .filter((session) => normalizeProjectPath(session.projectPath) === decoded.projectPath)
-      .sort((a, b) => {
-        const dateA = a.modified ? new Date(a.modified).getTime() : 0;
-        const dateB = b.modified ? new Date(b.modified).getTime() : 0;
-        return dateB - dateA;
-      });
-
+    const snapshot = await getSessionsSnapshot();
+    const sessions = snapshot.sessionsByProject.get(decoded.projectPath) || [];
     sendJSON(res, sessions);
   } catch (err) {
     sendError(res, 'Failed to read sessions: ' + err.message);
+  }
+}
+
+async function handleGetSessionsDigest(req, res, projectToken) {
+  const decoded = decodeToken(projectToken);
+  if (!decoded?.projectPath) {
+    sendError(res, 'Invalid project token', 400);
+    return;
+  }
+
+  try {
+    const snapshot = await getSessionsSnapshot();
+    const digest = snapshot.sessionsDigestByProject.get(decoded.projectPath) || [];
+    sendJSON(res, digest);
+  } catch (err) {
+    sendError(res, 'Failed to read sessions digest: ' + err.message);
   }
 }
 
@@ -1647,6 +2083,8 @@ async function handleRenameSession(req, res, projectToken, sessionToken) {
     return;
   }
 
+  invalidateSessionsSnapshotCache();
+
   sendJSON(res, {
     ok: true,
     customTitle: title,
@@ -1663,13 +2101,26 @@ async function handleRequest(req, res) {
     return sendJSON(res, await getInteractionCapabilities(config));
   }
 
+  if (pathname === '/api/claude-profiles' && req.method === 'GET') {
+    return handleGetClaudeProfiles(req, res);
+  }
+
   if (pathname === '/api/projects' && req.method === 'GET') {
     return handleGetProjects(req, res);
+  }
+
+  if (pathname === '/api/projects-digest' && req.method === 'GET') {
+    return handleGetProjectsDigest(req, res);
   }
 
   const sessionsMatch = pathname.match(/^\/api\/sessions\/([^/]+)$/);
   if (sessionsMatch && req.method === 'GET') {
     return handleGetSessions(req, res, decodeURIComponent(sessionsMatch[1]));
+  }
+
+  const sessionsDigestMatch = pathname.match(/^\/api\/sessions-digest\/([^/]+)$/);
+  if (sessionsDigestMatch && req.method === 'GET') {
+    return handleGetSessionsDigest(req, res, decodeURIComponent(sessionsDigestMatch[1]));
   }
 
   const messagesMatch = pathname.match(/^\/api\/messages\/([^/]+)\/([^/]+)$/);

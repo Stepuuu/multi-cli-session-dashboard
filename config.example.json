@@ -2,6 +2,7 @@
   "port": 3456,
   "workspaceRoot": "/path/to/your/workspace",
   "claudeProjectsDir": "/home/your-user/.claude/projects",
+  "claudeModelsFile": "/home/your-user/.models.json",
   "codexSessionsDir": "/home/your-user/.codex/sessions",
   "copilotSessionStateDir": "/home/your-user/.copilot/session-state",
   "codexBin": "codex",

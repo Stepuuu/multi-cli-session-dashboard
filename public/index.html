@@ -40,6 +40,15 @@
 
       <section id="chat-panel" class="panel">
         <div class="chat-header" id="chat-header">Select a session</div>
+        <div class="workspace-strip" id="workspace-strip">
+          <div class="workspace-strip-header">
+            <span class="workspace-strip-title">WORKSPACE</span>
+            <span class="workspace-strip-meta" id="workspace-strip-meta">Pin sessions to keep them one click away.</span>
+          </div>
+          <div class="workspace-strip-cards" id="workspace-strip-cards">
+            <div class="workspace-empty">No pinned sessions yet.</div>
+          </div>
+        </div>
         <div id="chat-messages" class="chat-messages">
           <div class="empty-state">
             <div class="empty-state-icon">_</div>
@@ -64,6 +73,7 @@
             <button id="composer-stop" class="composer-btn composer-btn-danger" disabled>Stop</button>
             <button id="composer-send" class="composer-btn composer-btn-primary" disabled>Send</button>
           </div>
+          <div class="composer-claude-profile" id="composer-claude-profile"></div>
         </div>
       </section>
     </main>

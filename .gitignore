@@ -2,3 +2,6 @@ config.json
 node_modules/
 *.log
 .DS_Store
+data/session-title-overrides.json
+data/claude-session-provenance.json
+data/session-metadata-cache.json

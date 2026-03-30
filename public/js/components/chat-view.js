@@ -69,20 +69,26 @@ function renderChatHeader(session) {
   const dateStr = date ? new Date(date).toLocaleString() : '';
   const branch = session.gitBranch ? `<span class="chat-tag branch">${escapeHtml(session.gitBranch)}</span>` : '';
   const model = session.model ? `<span class="chat-tag model">${escapeHtml(session.model)}</span>` : '';
+  const claudeConfig = session.source === 'claude' && session.claudeProfileLabel
+    ? `<span class="chat-tag config-tag" title="${escapeHtml(session.claudeConfigSource || '')}${session.claudeProfileHint ? `: ${escapeHtml(session.claudeProfileHint)}` : ''}">${escapeHtml(session.claudeProfileLabel)}</span>`
+    : '';
   const sourceLabel = escapeHtml(session.sourceShortLabel || session.sourceLabel || session.source || '?');
   const sourceClass = escapeHtml(session.source || 'unknown');
   const copyButton = `<button class="chat-header-btn" data-chat-action="copy-to-new-cx">New CX From This</button>`;
   const renameButton = `<button class="chat-header-btn" data-chat-action="rename-session">Rename</button>`;
+  const pinButton = `<button class="chat-header-btn${window.__dashboardIsPinnedSession && window.__dashboardIsPinnedSession(session.sessionId) ? ' is-active' : ''}" data-chat-action="toggle-pin-session">${window.__dashboardIsPinnedSession && window.__dashboardIsPinnedSession(session.sessionId) ? 'Unpin' : 'Pin'}</button>`;
 
   header.innerHTML = `
     <div class="chat-header-main">
       <span class="chat-header-title">${escapeHtml(truncate(session.firstPrompt || 'Session', 80))}</span>
       <span class="chat-tag source-tag source-${sourceClass}">${sourceLabel}</span>
+      ${claudeConfig}
       <span class="chat-tag">${dateStr}</span>
       ${branch}
       ${model}
     </div>
     <div class="chat-header-actions">
+      ${pinButton}
       ${copyButton}
       ${renameButton}
     </div>

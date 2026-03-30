@@ -162,7 +162,7 @@
 
 /* ===================== Session List ===================== */
 .session-item {
-  padding: 10px 72px 10px 16px;
+  padding: 10px 112px 10px 16px;
   cursor: pointer;
   border-left: 3px solid transparent;
   border-bottom: 1px solid var(--border-secondary);
@@ -268,6 +268,21 @@
   box-shadow: 0 0 0 1px rgba(88, 166, 255, 0.08), 0 0 12px rgba(88, 166, 255, 0.16);
 }
 
+.session-config-badge {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 34px;
+  padding: 0 7px;
+  border-radius: 999px;
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.3px;
+  color: #f0883e;
+  border: 1px solid rgba(240, 136, 62, 0.6);
+  background: rgba(240, 136, 62, 0.1);
+}
+
 .session-live-badge::before,
 .project-live-badge::before {
   content: '';
@@ -349,6 +364,37 @@
 
 .session-delete-btn:hover {
   background: rgba(255, 123, 114, 0.16);
+}
+
+.session-pin-btn {
+  position: absolute;
+  top: 10px;
+  right: 64px;
+  border: 1px solid rgba(88, 166, 255, 0.25);
+  background: rgba(88, 166, 255, 0.08);
+  color: #58a6ff;
+  border-radius: 999px;
+  padding: 2px 7px;
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.02em;
+  cursor: pointer;
+  opacity: 0;
+  transition: opacity 0.12s ease, background 0.12s ease;
+}
+
+.session-pin-btn.is-pinned {
+  background: rgba(88, 166, 255, 0.18);
+  border-color: rgba(88, 166, 255, 0.55);
+}
+
+.session-item:hover .session-pin-btn,
+.session-item.active .session-pin-btn {
+  opacity: 1;
+}
+
+.session-pin-btn:hover {
+  background: rgba(88, 166, 255, 0.18);
 }
 
 @keyframes live-pulse {
@@ -763,6 +809,116 @@
   background: var(--bg-hover);
 }
 
+.chat-header-btn.is-active {
+  background: rgba(88, 166, 255, 0.16);
+  border-color: rgba(88, 166, 255, 0.65);
+  color: #dceeff;
+}
+
+.workspace-strip-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.workspace-strip-title {
+  color: var(--text-accent);
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.7px;
+}
+
+.workspace-strip-meta {
+  color: var(--text-muted);
+  font-size: var(--fs-xs);
+}
+
+.workspace-empty {
+  color: var(--text-muted);
+  font-size: var(--fs-xs);
+  padding: 4px 0 0;
+}
+
+.workspace-card {
+  min-width: 0;
+  max-width: 240px;
+  text-align: left;
+  border: 1px solid var(--border-primary);
+  background: rgba(255, 255, 255, 0.02);
+  border-radius: 999px;
+  padding: 6px 10px;
+  color: var(--text-primary);
+  cursor: pointer;
+  transition: transform 0.14s ease, border-color 0.14s ease, background 0.14s ease;
+}
+
+.workspace-card:hover {
+  transform: translateY(-1px);
+  border-color: rgba(88, 166, 255, 0.34);
+  background: rgba(88, 166, 255, 0.06);
+}
+
+.workspace-card.active {
+  border-color: rgba(88, 166, 255, 0.62);
+  background: rgba(88, 166, 255, 0.16);
+  box-shadow: 0 0 0 1px rgba(88, 166, 255, 0.08);
+}
+
+.workspace-card.is-busy {
+  border-color: rgba(88, 166, 255, 0.52);
+  box-shadow: 0 0 0 1px rgba(88, 166, 255, 0.12), 0 0 12px rgba(88, 166, 255, 0.08);
+}
+
+.workspace-card-top {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+.workspace-live-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 999px;
+  background: #58a6ff;
+  box-shadow: 0 0 12px rgba(88, 166, 255, 0.8);
+  animation: live-pulse 1.4s ease-out infinite;
+}
+
+.workspace-card-remove {
+  margin-left: auto;
+  width: 18px;
+  height: 18px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 999px;
+  color: var(--text-muted);
+  font-size: 13px;
+  line-height: 1;
+  flex-shrink: 0;
+}
+
+.workspace-card-remove:hover {
+  background: rgba(255, 255, 255, 0.08);
+  color: var(--text-primary);
+}
+
+.workspace-card-title {
+  display: inline-block;
+  min-width: 0;
+  max-width: 140px;
+  margin-top: 0;
+  font-size: 12px;
+  font-weight: 600;
+  line-height: 1.2;
+  color: var(--text-primary);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
 .chat-tag {
   font-size: var(--fs-xs);
   padding: 1px 6px;
@@ -783,6 +939,11 @@
 
 .chat-tag.source-tag {
   font-weight: 700;
+}
+
+.chat-tag.config-tag {
+  color: #f0883e;
+  border-color: #f0883e;
 }
 
 /* ===================== Live Stream ===================== */
@@ -895,6 +1056,39 @@
   font-size: var(--fs-xs);
   line-height: 1.5;
   margin-bottom: 10px;
+}
+
+.composer-claude-profile {
+  margin-top: 10px;
+}
+
+.composer-profile-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  font-size: var(--fs-xs);
+  color: var(--text-secondary);
+}
+
+.composer-profile-label {
+  color: var(--text-muted);
+  font-weight: 700;
+  letter-spacing: 0.03em;
+}
+
+.composer-profile-select {
+  border: 1px solid var(--border-primary);
+  background: var(--bg-primary);
+  color: var(--text-primary);
+  border-radius: 6px;
+  padding: 4px 8px;
+  font-family: var(--font-mono);
+  font-size: var(--fs-xs);
+}
+
+.composer-profile-note {
+  color: var(--text-muted);
 }
 
 .composer-image-state {

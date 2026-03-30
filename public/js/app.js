@@ -10,6 +10,7 @@ const PAGE_SIZE = 50;
 const POLL_INTERVAL_MS = 4000;
 const DASHBOARD_STATE_KEY = 'session-dashboard-state-v1';
 const DASHBOARD_DRAFTS_KEY = 'session-dashboard-drafts-v1';
+const DASHBOARD_PINNED_KEY = 'session-dashboard-pinned-v1';
 let projectList = [];
 let sessionList = [];
 let totalMessages = 0;
@@ -26,6 +27,30 @@ const activeProjectBySession = new Map();
 const sessionStateCacheBySession = new Map();
 const sessionScrollModeBySession = new Map();
 const AUTO_FOLLOW_BOTTOM_THRESHOLD = 48;
+let projectsDigestSignature = '';
+const sessionDigestSignatureByProject = new Map();
+let pinnedSessions = [];
+
+function buildProjectDigestSignature(projects) {
+  return JSON.stringify((projects || []).map((project) => ([
+    project.dirName || '',
+    project.sessionCount || 0,
+    project.latestModified || project.latestModifiedMs || 0,
+    JSON.stringify(project.sourceCounts || {}),
+  ])));
+}
+
+function buildSessionDigestSignature(sessions) {
+  return JSON.stringify((sessions || []).map((session) => ([
+    session.sessionId || '',
+    session.source || '',
+    session.rawSessionId || '',
+    session.modified || '',
+    session.messageCount || 0,
+    session.model || '',
+    session.customTitle || session.firstPrompt || '',
+  ])));
+}
 
 function safeReadStorage(key, fallback) {
   try {
@@ -51,6 +76,15 @@ function persistDraftSessions() {
 
 function loadPersistedDraftSessions() {
   const stored = safeReadStorage(DASHBOARD_DRAFTS_KEY, []);
+  return Array.isArray(stored) ? stored : [];
+}
+
+function persistPinnedSessions() {
+  safeWriteStorage(DASHBOARD_PINNED_KEY, pinnedSessions);
+}
+
+function loadPersistedPinnedSessions() {
+  const stored = safeReadStorage(DASHBOARD_PINNED_KEY, []);
   return Array.isArray(stored) ? stored : [];
 }
 
@@ -100,6 +134,12 @@ function displayedSessionList() {
   return [...currentDraftSessions(), ...sessionList];
 }
 
+function pinnedSessionIdSet() {
+  return new Set(pinnedSessions.map((session) => session.sessionId));
+}
+
+window.__dashboardIsPinnedSession = (sessionId) => pinnedSessionIdSet().has(sessionId);
+
 function activeProjectIds() {
   return new Set(activeProjectBySession.values());
 }
@@ -109,15 +149,159 @@ function renderProjectSidebar() {
 }
 
 function renderDisplayedSessionList() {
-  renderSessionList(displayedSessionList(), selectedSession, activeInteractionSessions);
+  renderSessionList(displayedSessionList(), selectedSession, activeInteractionSessions, pinnedSessionIdSet());
 }
 
 function findSessionMetaById(id) {
   return displayedSessionList().find((session) => session.sessionId === id) || null;
 }
 
+function updatePinnedSessionSnapshot(meta, projectDir = selectedProject) {
+  if (!meta?.sessionId) return;
+  pinnedSessions = pinnedSessions.map((session) => {
+    if (session.sessionId !== meta.sessionId) return session;
+    return {
+      ...session,
+      sessionId: meta.sessionId,
+      projectDir: projectDir || session.projectDir,
+      projectName: meta.projectName || session.projectName,
+      source: meta.source || session.source,
+      sourceLabel: meta.sourceLabel || session.sourceLabel,
+      sourceShortLabel: meta.sourceShortLabel || session.sourceShortLabel,
+      firstPrompt: meta.firstPrompt || meta.defaultFirstPrompt || session.firstPrompt || '(no prompt)',
+      customTitle: meta.customTitle || '',
+      defaultFirstPrompt: meta.defaultFirstPrompt || meta.firstPrompt || session.defaultFirstPrompt || '(no prompt)',
+      summary: meta.summary || '',
+      modified: meta.modified || session.modified || '',
+      messageCount: meta.messageCount || 0,
+      rawSessionId: meta.rawSessionId || session.rawSessionId || '',
+      isDraft: !!meta.isDraft,
+    };
+  });
+}
+
+function removePinnedSession(sessionId) {
+  const before = pinnedSessions.length;
+  pinnedSessions = pinnedSessions.filter((session) => session.sessionId !== sessionId);
+  if (pinnedSessions.length !== before) {
+    persistPinnedSessions();
+  }
+}
+
+function pinSession(meta, projectDir = selectedProject) {
+  if (!meta?.sessionId || !projectDir) return;
+  removePinnedSession(meta.sessionId);
+  pinnedSessions.unshift({
+    sessionId: meta.sessionId,
+    projectDir,
+    projectName: meta.projectName || '',
+    source: meta.source || '',
+    sourceLabel: meta.sourceLabel || '',
+    sourceShortLabel: meta.sourceShortLabel || '',
+    firstPrompt: meta.firstPrompt || meta.defaultFirstPrompt || '(no prompt)',
+    customTitle: meta.customTitle || '',
+    defaultFirstPrompt: meta.defaultFirstPrompt || meta.firstPrompt || '(no prompt)',
+    summary: meta.summary || '',
+    modified: meta.modified || '',
+    messageCount: meta.messageCount || 0,
+    rawSessionId: meta.rawSessionId || '',
+    isDraft: !!meta.isDraft,
+  });
+  pinnedSessions = pinnedSessions.slice(0, 8);
+  persistPinnedSessions();
+}
+
+function togglePinSession(sessionId) {
+  const meta = findSessionMetaById(sessionId);
+  if (!meta) return;
+  if (pinnedSessionIdSet().has(sessionId)) {
+    removePinnedSession(sessionId);
+  } else {
+    pinSession(meta);
+  }
+  renderDisplayedSessionList();
+  if (selectedSession === sessionId && sessionMeta) {
+    renderChatHeader(sessionMeta);
+  }
+  renderWorkspaceStrip();
+}
+
+function renderWorkspaceStrip() {
+  const metaEl = document.getElementById('workspace-strip-meta');
+  const cardsEl = document.getElementById('workspace-strip-cards');
+  if (!metaEl || !cardsEl) return;
+
+  if (!pinnedSessions.length) {
+    metaEl.textContent = 'Pin sessions to keep them one click away.';
+    cardsEl.innerHTML = '<div class="workspace-empty">No pinned sessions yet.</div>';
+    return;
+  }
+
+  const activeCount = pinnedSessions.filter((session) => activeInteractionSessions.has(session.sessionId)).length;
+  metaEl.textContent = `${pinnedSessions.length} pinned${activeCount ? ` · ${activeCount} live` : ''}`;
+
+  cardsEl.innerHTML = pinnedSessions.map((session) => {
+    const active = session.sessionId === selectedSession;
+    const busy = activeInteractionSessions.has(session.sessionId);
+    const sourceClass = escapeHtml(session.source || 'unknown');
+    const sourceLabel = escapeHtml(session.sourceShortLabel || session.sourceLabel || session.source || '?');
+    const rawTitle = session.customTitle || session.firstPrompt || session.defaultFirstPrompt || '(no prompt)';
+    const title = escapeHtml(truncate(rawTitle, 34));
+    const projectName = escapeHtml(session.projectName || 'project');
+    const date = escapeHtml(formatRelativeDate(session.modified || ''));
+    const tooltip = escapeHtml(`${rawTitle}\n${projectName} · ${date} · ${session.messageCount || 0} msgs`);
+    return `
+      <button class="workspace-card${active ? ' active' : ''}${busy ? ' is-busy' : ''}" data-workspace-session="${escapeHtml(session.sessionId)}" title="${tooltip}">
+        <span class="workspace-card-top">
+          <span class="session-source-badge source-${sourceClass}">${sourceLabel}</span>
+          ${busy ? '<span class="workspace-live-dot"></span>' : ''}
+          <span class="workspace-card-title">${title}</span>
+          <span class="workspace-card-remove" data-workspace-remove="${escapeHtml(session.sessionId)}" title="Remove from workspace">×</span>
+        </span>
+      </button>
+    `;
+  }).join('');
+
+  cardsEl.querySelectorAll('[data-workspace-session]').forEach((el) => {
+    el.addEventListener('click', async (event) => {
+      const removeTarget = event.target.closest('[data-workspace-remove]');
+      if (removeTarget) return;
+      const sessionId = el.dataset.workspaceSession;
+      const pinned = pinnedSessions.find((session) => session.sessionId === sessionId);
+      if (!pinned) return;
+      if (selectedProject === pinned.projectDir) {
+        selectSessionById(sessionId);
+        return;
+      }
+      await loadSessions(pinned.projectDir, {
+        sessionId: pinned.sessionId,
+        source: pinned.source,
+        rawSessionId: pinned.rawSessionId,
+      });
+      if (selectedSession !== pinned.sessionId) {
+        removePinnedSession(pinned.sessionId);
+        renderDisplayedSessionList();
+        renderWorkspaceStrip();
+      }
+    });
+  });
+
+  cardsEl.querySelectorAll('[data-workspace-remove]').forEach((el) => {
+    el.addEventListener('click', (event) => {
+      event.stopPropagation();
+      removePinnedSession(el.dataset.workspaceRemove);
+      renderDisplayedSessionList();
+      renderWorkspaceStrip();
+    });
+  });
+}
+
 function currentSessionHasTransientActivity() {
   return !!(selectedSession && (transientMessagesBySession.get(selectedSession) || []).length);
+}
+
+function currentSessionHasActiveDashboardInteraction() {
+  return !!(selectedSession && activeInteractionSessions.has(selectedSession));
 }
 
 function renderCurrentChat() {
@@ -147,11 +331,13 @@ function shouldAutoFollowSession(sessionId = selectedSession) {
 
 function cacheSessionState(sessionId = selectedSession, meta = sessionMeta) {
   if (!sessionId || meta?.isDraft) return;
+  const container = chatContainer();
   sessionStateCacheBySession.set(sessionId, {
     messages: messages.slice(),
     offset,
     totalMessages,
     hasMoreOlder,
+    scrollTop: container ? container.scrollTop : 0,
   });
 }
 
@@ -165,6 +351,13 @@ function restoreCachedSessionState(sessionId) {
   renderCurrentChat();
   if (shouldAutoFollowSession(sessionId)) {
     scrollChatToBottom();
+  } else {
+    const container = chatContainer();
+    if (container) {
+      requestAnimationFrame(() => {
+        container.scrollTop = cached.scrollTop || 0;
+      });
+    }
   }
   return true;
 }
@@ -189,6 +382,9 @@ function setTransientMessagesForSession(sessionId, nextMessages) {
   } else {
     transientMessagesBySession.delete(sessionId);
   }
+  if (sessionId !== selectedSession) {
+    return;
+  }
   renderCurrentChat();
   if (followBeforeRender) {
     scrollChatToBottom();
@@ -202,6 +398,9 @@ function clearTransientMessagesForSession(sessionId) {
     : shouldAutoFollowSession(sessionId);
   setSessionAutoFollow(sessionId, followBeforeRender);
   transientMessagesBySession.delete(sessionId);
+  if (sessionId !== selectedSession) {
+    return;
+  }
   renderCurrentChat();
   if (followBeforeRender) {
     scrollChatToBottom();
@@ -242,11 +441,21 @@ async function reloadSessionsAndSelect(projectDir, matcher) {
 
 async function refreshCurrentProjectSessionsSilently() {
   if (!selectedProject) return;
+  const digest = await fetchJSON(`/api/sessions-digest/${encodeURIComponent(selectedProject)}`);
+  if (!digest) return false;
+
+  const nextDigestSignature = buildSessionDigestSignature(digest);
+  const previousDigestSignature = sessionDigestSignatureByProject.get(selectedProject) || '';
+  if (nextDigestSignature === previousDigestSignature) {
+    return false;
+  }
+
   const data = await fetchJSON(`/api/sessions/${encodeURIComponent(selectedProject)}`);
-  if (!data) return;
+  if (!data) return false;
 
   const previousSelected = selectedSession;
   sessionList = data;
+  sessionDigestSignatureByProject.set(selectedProject, buildSessionDigestSignature(sessionList));
   reconcileDraftSessionsForProject(selectedProject, sessionList);
   renderDisplayedSessionList();
 
@@ -254,10 +463,14 @@ async function refreshCurrentProjectSessionsSilently() {
     const nextMeta = findSessionMetaById(previousSelected);
     if (nextMeta) {
       sessionMeta = nextMeta;
+      updatePinnedSessionSnapshot(nextMeta, selectedProject);
       renderChatHeader(sessionMeta);
+      renderWorkspaceStrip();
       persistDashboardState();
     }
   }
+
+  return true;
 }
 
 function matchSessionByMatcher(items, matcher) {
@@ -325,6 +538,7 @@ function rememberCreatedSessionForDraft(draftSessionId, createdSession) {
       sessionMeta = findSessionMetaById(draftSessionId) || sessionMeta;
       persistDashboardState();
     }
+    renderWorkspaceStrip();
   }
 }
 
@@ -353,6 +567,14 @@ window.__dashboardReloadSessionsAndSelect = reloadSessionsAndSelect;
 window.__dashboardRememberCreatedSessionForDraft = rememberCreatedSessionForDraft;
 window.__dashboardMarkSessionNeedsHydration = (sessionId) => {
   if (sessionId) sessionsNeedingHydration.add(sessionId);
+};
+window.__dashboardPrepareSessionForNewInteraction = async (sessionId) => {
+  if (!sessionId || sessionId !== selectedSession) return;
+  const hasTransient = (transientMessagesBySession.get(sessionId) || []).length > 0;
+  const isActive = activeInteractionSessions.has(sessionId);
+  if (sessionsNeedingHydration.has(sessionId) || (hasTransient && !isActive)) {
+    await reloadCurrentSession();
+  }
 };
 window.__dashboardFinalizeInteractionHydration = async ({ projectToken, sessionId, createdSession } = {}) => {
   if (!sessionId) return;
@@ -578,7 +800,9 @@ function applySessionTitleLocally(sessionId, title, options = {}) {
 
   draftSessions = draftSessions.map(mutate);
   sessionList = sessionList.map(mutate);
+  updatePinnedSessionSnapshot(findSessionMetaById(sessionId) || draftSessions.find((session) => session.sessionId === sessionId) || null);
   persistDraftSessions();
+  persistPinnedSessions();
 
   if (selectedSession === sessionId) {
     sessionMeta = findSessionMetaById(sessionId) || sessionMeta;
@@ -587,6 +811,7 @@ function applySessionTitleLocally(sessionId, title, options = {}) {
   }
 
   renderDisplayedSessionList();
+  renderWorkspaceStrip();
 }
 
 async function renameSelectedSession() {
@@ -672,11 +897,11 @@ function selectSessionById(sessionId, options = {}) {
 
   selectedSession = sessionId;
   sessionMeta = meta;
-  if (!sessionScrollModeBySession.has(sessionId)) {
-    setSessionAutoFollow(sessionId, true);
-  }
+  setSessionAutoFollow(sessionId, true);
+  updatePinnedSessionSnapshot(meta, selectedProject);
   renderDisplayedSessionList();
   renderChatHeader(sessionMeta);
+  renderWorkspaceStrip();
   persistDashboardState();
   notifySessionSelection();
 
@@ -692,13 +917,17 @@ function selectSessionById(sessionId, options = {}) {
     return;
   }
 
-  if ((transientMessagesBySession.get(sessionId) || []).length > 0 && restoreCachedSessionState(sessionId)) {
-    return;
-  }
-
   if (sessionsNeedingHydration.has(sessionId)) {
     reloadCurrentSession();
     return;
+  }
+
+  if (activeInteractionSessions.has(sessionId) && (transientMessagesBySession.get(sessionId) || []).length > 0 && restoreCachedSessionState(sessionId)) {
+    return;
+  }
+
+  if (!activeInteractionSessions.has(sessionId) && (transientMessagesBySession.get(sessionId) || []).length > 0) {
+    clearTransientMessagesForSession(sessionId);
   }
 
   if (!options.skipFetch) {
@@ -726,6 +955,7 @@ async function deleteSessionById(sessionId) {
   if (meta.isDraft) {
     draftSessions = draftSessions.filter((session) => session.sessionId !== sessionId);
     persistDraftSessions();
+    removePinnedSession(sessionId);
     sessionStateCacheBySession.delete(sessionId);
     if (selectedSession === sessionId) {
       selectedSession = null;
@@ -737,6 +967,7 @@ async function deleteSessionById(sessionId) {
       notifySessionSelection();
     }
     renderDisplayedSessionList();
+    renderWorkspaceStrip();
     return;
   }
 
@@ -758,7 +989,9 @@ async function deleteSessionById(sessionId) {
     notifySessionSelection();
   }
 
+  removePinnedSession(sessionId);
   await loadSessions(selectedProject);
+  renderWorkspaceStrip();
 }
 
 async function loadProjects() {
@@ -769,7 +1002,9 @@ async function loadProjects() {
     return;
   }
   projectList = data;
+  projectsDigestSignature = buildProjectDigestSignature(projectList);
   renderProjectSidebar();
+  renderWorkspaceStrip();
   updateStatusBar();
   const restored = await restoreInitialDashboardView();
   if (!restored && projectList.length > 0) {
@@ -778,11 +1013,22 @@ async function loadProjects() {
 }
 
 async function refreshProjectsSilently() {
+  const digest = await fetchJSON('/api/projects-digest');
+  if (!digest) return false;
+
+  const nextDigestSignature = buildProjectDigestSignature(digest);
+  if (nextDigestSignature === projectsDigestSignature) {
+    return false;
+  }
+
   const data = await fetchJSON('/api/projects');
-  if (!data) return;
+  if (!data) return false;
   projectList = data;
+  projectsDigestSignature = buildProjectDigestSignature(projectList);
   renderProjectSidebar();
+  renderWorkspaceStrip();
   updateStatusBar();
+  return true;
 }
 
 async function loadSessions(projectDir, matcher = null) {
@@ -811,8 +1057,15 @@ async function loadSessions(projectDir, matcher = null) {
   }
 
   sessionList = data;
+  sessionDigestSignatureByProject.set(projectDir, buildSessionDigestSignature(sessionList));
   reconcileDraftSessionsForProject(projectDir, sessionList);
+  pinnedSessions = pinnedSessions.filter((session) => {
+    if (session.projectDir !== projectDir) return true;
+    return displayedSessionList().some((candidate) => candidate.sessionId === session.sessionId);
+  });
+  persistPinnedSessions();
   renderDisplayedSessionList();
+  renderWorkspaceStrip();
   updateStatusBar();
 
   if (matcher) {
@@ -832,19 +1085,25 @@ async function loadSessions(projectDir, matcher = null) {
 async function pollSelectedSessionUpdates() {
   if (pollInFlight || document.hidden) return;
   if (!selectedProject) return;
-  if (currentSessionHasTransientActivity() && !(sessionMeta && sessionMeta.isDraft && sessionMeta.rawSessionId)) return;
+
+  if (currentSessionHasTransientActivity()) {
+    if (currentSessionHasActiveDashboardInteraction()) {
+      return;
+    }
+
+    // A previous dashboard interaction left stale transient items behind.
+    // They should not block external CLI refreshes for this session.
+    clearTransientMessagesForSession(selectedSession);
+    sessionsNeedingHydration.delete(selectedSession);
+    sessionStateCacheBySession.delete(selectedSession);
+  }
 
   pollInFlight = true;
   try {
     await refreshProjectsSilently();
 
-    const data = await fetchJSON(`/api/sessions/${encodeURIComponent(selectedProject)}`);
-    if (!data) return;
-
     const previousMeta = selectedSession ? sessionList.find((session) => session.sessionId === selectedSession) || sessionMeta : null;
-    sessionList = data;
-    reconcileDraftSessionsForProject(selectedProject, sessionList);
-    renderDisplayedSessionList();
+    await refreshCurrentProjectSessionsSilently();
 
     if (!selectedSession) return;
     if (sessionMeta && sessionMeta.isDraft) {
@@ -870,7 +1129,9 @@ async function pollSelectedSessionUpdates() {
       previousMeta.model !== nextMeta.model;
 
     sessionMeta = nextMeta;
+    updatePinnedSessionSnapshot(nextMeta, selectedProject);
     renderChatHeader(sessionMeta);
+    renderWorkspaceStrip();
     persistDashboardState();
 
     if (changed && !isLoading) {
@@ -917,12 +1178,13 @@ async function loadMessages(projectDir, sessionId, loadOlder) {
 
   if (loadOlder) {
     // Prepend older messages
-    messages = [...data.messages, ...messages];
     const chatContainer = document.getElementById('chat-messages');
     const prevScrollHeight = chatContainer.scrollHeight;
+    const prevScrollTop = chatContainer.scrollTop;
+    messages = [...data.messages, ...messages];
     renderCurrentChat();
     // Maintain scroll position after prepending
-    chatContainer.scrollTop = chatContainer.scrollHeight - prevScrollHeight;
+    chatContainer.scrollTop = prevScrollTop + (chatContainer.scrollHeight - prevScrollHeight);
   } else {
     messages = data.messages || [];
     renderCurrentChat();
@@ -971,6 +1233,8 @@ function updateStatus(text) {
 // ==================== Init ====================
 document.addEventListener('DOMContentLoaded', () => {
   draftSessions = loadPersistedDraftSessions();
+  pinnedSessions = loadPersistedPinnedSessions();
+  renderWorkspaceStrip();
 
   fetchJSON('/api/capabilities').then((data) => {
     dashboardCapabilities = data;
@@ -991,6 +1255,10 @@ document.addEventListener('DOMContentLoaded', () => {
     deleteSessionById(id);
   });
 
+  onSessionPin((id) => {
+    togglePinSession(id);
+  });
+
   const chatHeader = document.getElementById('chat-header');
   if (chatHeader) {
     chatHeader.addEventListener('click', (event) => {
@@ -1001,6 +1269,8 @@ document.addEventListener('DOMContentLoaded', () => {
         renameSelectedSession();
       } else if (action === 'copy-to-new-cx') {
         continueSelectedSessionAsNewCodex();
+      } else if (action === 'toggle-pin-session' && selectedSession) {
+        togglePinSession(selectedSession);
       }
     });
   }

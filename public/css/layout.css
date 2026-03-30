@@ -63,6 +63,22 @@ html, body {
   background: var(--bg-secondary);
 }
 
+.workspace-strip {
+  border-bottom: 1px solid var(--border-primary);
+  background:
+    linear-gradient(180deg, rgba(88, 166, 255, 0.06), transparent 80%),
+    var(--bg-secondary);
+  padding: 6px 16px 8px;
+  flex-shrink: 0;
+}
+
+.workspace-strip-cards {
+  display: flex;
+  gap: 8px;
+  overflow-x: auto;
+  padding-top: 6px;
+}
+
 .chat-messages {
   flex: 1;
   overflow-y: auto;

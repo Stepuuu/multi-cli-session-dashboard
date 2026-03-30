@@ -25,6 +25,7 @@ SESSION_DASHBOARD_CONFIG=/path/to/config.json npm start
 - `port`
 - `workspaceRoot`
 - `claudeProjectsDir`
+- `claudeModelsFile`
 - `codexSessionsDir`
 - `copilotSessionStateDir`
 - `codexBin`
@@ -38,6 +39,7 @@ SESSION_DASHBOARD_CONFIG=/path/to/config.json npm start
 - `SESSION_DASHBOARD_PORT`
 - `SESSION_DASHBOARD_WORKSPACE_ROOT`
 - `CLAUDE_PROJECTS_DIR`
+- `CLAUDE_MODELS_FILE`
 - `CODEX_SESSIONS_DIR`
 - `COPILOT_SESSION_STATE_DIR`
 - `CODEX_BIN`

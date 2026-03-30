@@ -24,6 +24,8 @@
 | Draft sessions | Start new sessions from a selected project and send the first prompt from the browser | 选中项目后可在浏览器中创建新会话并发送首条消息 |
 | Live interaction | Stream status, tool events, and model replies into the chat timeline | 将状态、工具事件、回复实时流式插入聊天记录 |
 | Image input | Paste or upload images; use native attachments when available | 支持粘贴/上传图片；可用时走原生图片附件 |
+| Workspace tabs | Pin frequently used sessions for one-click switching across projects | 固定常用会话，单窗口跨项目一键切换 |
+| Smarter refresh | Lightweight digests and metadata caching reduce unnecessary rescans | 轻量 digest 与元数据缓存减少重复扫描 |
 | No framework lock-in | Plain Node.js + vanilla frontend, easy to fork and adapt | 纯 Node.js + 原生前端，易于二次开发 |
 
 ### Quick Start / 快速开始
