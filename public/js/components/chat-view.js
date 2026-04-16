@@ -72,20 +72,64 @@ function renderChatHeader(session) {
   const claudeConfig = session.source === 'claude' && session.claudeProfileLabel
     ? `<span class="chat-tag config-tag" title="${escapeHtml(session.claudeConfigSource || '')}${session.claudeProfileHint ? `: ${escapeHtml(session.claudeProfileHint)}` : ''}">${escapeHtml(session.claudeProfileLabel)}</span>`
     : '';
+  const cacheInfo = typeof window.__dashboardSessionCacheInfo === 'function'
+    ? window.__dashboardSessionCacheInfo(session)
+    : null;
+  const cacheTooltip = typeof window.__dashboardBuildSessionCacheTooltip === 'function'
+    ? window.__dashboardBuildSessionCacheTooltip(session)
+    : '';
+  const cacheTag = cacheInfo
+    ? `<span class="chat-tag cache-tag" title="${escapeAttr(cacheTooltip)}">CACHE ${cacheInfo.percent}%</span>`
+    : '';
+  const archivedTag = session.archived
+    ? '<span class="chat-tag archived-tag" title="Archived in VS Code Codex">ARCHIVED</span>'
+    : '';
+  const forkTooltip = typeof window.__dashboardBuildSessionForkTooltip === 'function'
+    ? window.__dashboardBuildSessionForkTooltip(session)
+    : '';
+  const forkTag = session.forkedFromId
+    ? `<span class="chat-tag fork-tag" title="${escapeAttr(forkTooltip || `Forked from ${session.forkedFromId}`)}">FROM ${escapeHtml(session.forkedFromId)}</span>`
+    : '';
+  const fileSizeLabel = typeof window.__dashboardSessionFileSizeLabel === 'function'
+    ? window.__dashboardSessionFileSizeLabel(session)
+    : '';
+  const fileSizeTooltip = typeof window.__dashboardSessionFileSizeTooltip === 'function'
+    ? window.__dashboardSessionFileSizeTooltip(session)
+    : '';
+  const fileSizeTag = fileSizeLabel
+    ? `<span class="chat-tag file-tag" title="${escapeAttr(fileSizeTooltip || fileSizeLabel)}">${escapeHtml(fileSizeLabel)}</span>`
+    : '';
+  const contextInfo = typeof window.__dashboardSessionContextInfo === 'function'
+    ? window.__dashboardSessionContextInfo(session)
+    : null;
+  const contextTooltip = typeof window.__dashboardBuildSessionContextTooltip === 'function'
+    ? window.__dashboardBuildSessionContextTooltip(session)
+    : '';
+  const contextBar = contextInfo
+    ? `<span class="chat-context-bar" title="${escapeAttr(contextTooltip)}"><span class="chat-context-bar-fill" style="width:${Math.max(2, contextInfo.percent)}%"></span></span>`
+    : '';
   const sourceLabel = escapeHtml(session.sourceShortLabel || session.sourceLabel || session.source || '?');
   const sourceClass = escapeHtml(session.source || 'unknown');
+  const titleTooltip = typeof window.__dashboardBuildSessionTitleTooltip === 'function'
+    ? window.__dashboardBuildSessionTitleTooltip(session)
+    : (session.firstPrompt || 'Session');
   const copyButton = `<button class="chat-header-btn" data-chat-action="copy-to-new-cx">New CX From This</button>`;
   const renameButton = `<button class="chat-header-btn" data-chat-action="rename-session">Rename</button>`;
   const pinButton = `<button class="chat-header-btn${window.__dashboardIsPinnedSession && window.__dashboardIsPinnedSession(session.sessionId) ? ' is-active' : ''}" data-chat-action="toggle-pin-session">${window.__dashboardIsPinnedSession && window.__dashboardIsPinnedSession(session.sessionId) ? 'Unpin' : 'Pin'}</button>`;
 
   header.innerHTML = `
     <div class="chat-header-main">
-      <span class="chat-header-title">${escapeHtml(truncate(session.firstPrompt || 'Session', 80))}</span>
+      <span class="chat-header-title" title="${escapeAttr(titleTooltip)}">${escapeHtml(truncate(session.firstPrompt || 'Session', 80))}</span>
       <span class="chat-tag source-tag source-${sourceClass}">${sourceLabel}</span>
+      ${forkTag}
+      ${fileSizeTag}
       ${claudeConfig}
+      ${cacheTag}
+      ${archivedTag}
       <span class="chat-tag">${dateStr}</span>
       ${branch}
       ${model}
+      ${contextBar}
     </div>
     <div class="chat-header-actions">
       ${pinButton}
@@ -295,6 +339,10 @@ function renderAssistantMessage(msg, time, modelHtml) {
     for (const block of msg.content) {
       if (block.type === 'text') {
         bodyParts += renderTextContent(block.text || '');
+      } else if (block.type === 'thinking') {
+        bodyParts += renderThinkingBlock(block);
+      } else if (block.type === 'redacted_thinking') {
+        bodyParts += renderThinkingBlock(block, true);
       } else if (block.type === 'tool_use') {
         bodyParts += renderToolBlock(block);
       } else if (block.type === 'tool_result') {
@@ -304,6 +352,8 @@ function renderAssistantMessage(msg, time, modelHtml) {
   } else if (typeof msg.content === 'string') {
     bodyParts = renderTextContent(msg.content);
   }
+
+  if (!bodyParts) return '';
 
   return `
     <div class="chat-msg ${messageClass('assistant-msg', msg)}">
@@ -440,6 +490,30 @@ function renderToolBlock(block) {
     <div class="tool-block" onclick="this.classList.toggle('expanded')">
       <div class="tool-header">
         <span class="tool-badge">${name}</span>
+        <span class="tool-summary">${summaryText}</span>
+        <span class="tool-toggle">&#9654;</span>
+      </div>
+      <pre class="tool-detail">${detailText}</pre>
+    </div>
+  `;
+}
+
+function renderThinkingBlock(block, redacted = false) {
+  const content = typeof block.text === 'string' ? block.text : '';
+  const summarySource = content.trim()
+    ? content.trim().split('\n')[0]
+    : (redacted ? 'Reasoning content redacted by source session' : 'Thinking');
+  const summaryText = escapeHtml(truncate(summarySource, 80));
+  const detailText = escapeHtml(content || (redacted
+    ? 'Reasoning content was redacted by the source session.'
+    : 'No thinking content recorded.'));
+  const badge = redacted ? 'Thinking (redacted)' : 'Thinking';
+  const classes = redacted ? 'tool-block thinking-block redacted-thinking-block' : 'tool-block thinking-block';
+
+  return `
+    <div class="${classes}" onclick="this.classList.toggle('expanded')">
+      <div class="tool-header">
+        <span class="tool-badge">${escapeHtml(badge)}</span>
         <span class="tool-summary">${summaryText}</span>
         <span class="tool-toggle">&#9654;</span>
       </div>

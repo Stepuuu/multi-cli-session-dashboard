@@ -27,6 +27,19 @@ html, body {
   overflow: hidden;
 }
 
+.backend-status-banner {
+  flex-shrink: 0;
+  padding: 8px 16px;
+  border-bottom: 1px solid var(--border-primary);
+  background: rgba(240, 136, 62, 0.12);
+  color: #f0883e;
+  font-size: var(--fs-xs);
+}
+
+.backend-status-banner.is-hidden {
+  display: none;
+}
+
 .panel {
   overflow-y: auto;
   border-right: 1px solid var(--border-primary);
@@ -48,6 +61,7 @@ html, body {
   display: flex;
   flex-direction: column;
   overflow: hidden;
+  position: relative;
 }
 
 .chat-header {
@@ -90,4 +104,6 @@ html, body {
   border-top: 1px solid var(--border-primary);
   background: var(--bg-secondary);
   padding: 12px 16px 14px;
+  position: relative;
+  z-index: 2;
 }

@@ -1,20 +1,27 @@
 import http from 'node:http';
 import fsp from 'node:fs/promises';
 import path from 'node:path';
-import { createReadStream } from 'node:fs';
+import { createReadStream, existsSync } from 'node:fs';
 import readline from 'node:readline';
 import { fileURLToPath } from 'node:url';
 import { randomUUID } from 'node:crypto';
+import { execFile } from 'node:child_process';
+import { promisify } from 'node:util';
 import { getInteractionCapabilities, handleInteractionRequest } from './interaction.js';
 import { loadRuntimeConfig } from './config.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const execFileAsync = promisify(execFile);
 
 const SOURCE_META = {
   claude: { label: 'Claude', shortLabel: 'CC' },
   codex: { label: 'Codex', shortLabel: 'CX' },
   copilot: { label: 'Copilot', shortLabel: 'CP' },
 };
+
+const CLAUDE_SYNTHETIC_WARMUP_PROMPT = 'Warmup';
+const CLAUDE_SYNTHETIC_SUMMARY_PREFIX = 'Context: This summary will be shown in a list to help users and Claude choose which conversations are relevant.';
+const CLAUDE_SYNTHETIC_JUDGE_PREFIX = 'Analyze this conversation and determine: Does the assistant have more autonomous work to do RIGHT NOW?';
 
 const config = loadRuntimeConfig();
 
@@ -35,19 +42,27 @@ const TRASH_ROOT = '/tmp/session-dashboard-trash';
 const SESSION_TITLE_OVERRIDES_FILE = path.join(__dirname, 'data', 'session-title-overrides.json');
 const CLAUDE_PROVENANCE_FILE = path.join(__dirname, 'data', 'claude-session-provenance.json');
 const SESSION_METADATA_CACHE_FILE = path.join(__dirname, 'data', 'session-metadata-cache.json');
-const SESSION_SNAPSHOT_TTL_MS = 1500;
+const SESSION_SNAPSHOT_TTL_MS = 10000;
 const MESSAGE_CACHE_LIMIT = 32;
+const LARGE_SESSION_FAST_PATH_BYTES = 2 * 1024 * 1024;
+const RECENT_TAIL_LINES_INITIAL = 2000;
+const RECENT_TAIL_LINES_MAX = 16000;
 let sessionTitleOverridesLoaded = false;
 let sessionTitleOverrides = {};
 let claudeProvenanceLoaded = false;
 let claudeSessionProvenance = {};
-let claudeProfilesLoaded = false;
 let claudeProfilesCache = null;
+let claudeProfilesFilePath = '';
+let claudeProfilesFingerprint = '';
 let sessionMetadataCacheLoaded = false;
 let sessionMetadataCacheDirty = false;
 const sessionMetadataCache = new Map();
 let sessionsSnapshotCache = null;
+let sessionsSnapshotRefreshPromise = null;
 const messageParseCache = new Map();
+const recentMessageCache = new Map();
+let resolvedCodexStateDbPath = '';
+let codexStateDbPathResolved = false;
 
 function sendJSON(res, data, status = 200) {
   const body = JSON.stringify(data);
@@ -62,6 +77,40 @@ function sendJSON(res, data, status = 200) {
 
 function sendError(res, message, status = 500) {
   sendJSON(res, { error: message }, status);
+}
+
+function isAllowedLoopbackOrigin(origin) {
+  if (typeof origin !== 'string' || !origin) return false;
+  try {
+    const parsed = new URL(origin);
+    return parsed.protocol === 'http:' && (
+      parsed.hostname === 'localhost' ||
+      parsed.hostname === '127.0.0.1'
+    );
+  } catch {
+    return false;
+  }
+}
+
+function buildCorsHeaders(req) {
+  const origin = req.headers.origin;
+  if (!isAllowedLoopbackOrigin(origin)) return null;
+  return {
+    'Access-Control-Allow-Origin': origin,
+    'Access-Control-Allow-Methods': 'GET,POST,PUT,DELETE,OPTIONS',
+    'Access-Control-Allow-Headers': 'Content-Type',
+    'Access-Control-Max-Age': '600',
+    Vary: 'Origin',
+  };
+}
+
+function buildHealthPayload() {
+  return {
+    ok: true,
+    pid: process.pid,
+    uptimeSec: Math.round(process.uptime()),
+    timestamp: new Date().toISOString(),
+  };
 }
 
 async function ensureSessionTitleOverridesLoaded() {
@@ -122,6 +171,7 @@ async function persistSessionMetadataCache() {
 
 function invalidateSessionsSnapshotCache() {
   sessionsSnapshotCache = null;
+  sessionsSnapshotRefreshPromise = null;
 }
 
 function buildSessionMetadataCacheKey(source, filePath) {
@@ -131,6 +181,10 @@ function buildSessionMetadataCacheKey(source, filePath) {
 function buildFileFingerprint(stat, extra = '') {
   const extraPart = extra ? `:${extra}` : '';
   return `${Math.floor(stat.mtimeMs)}:${stat.size}${extraPart}`;
+}
+
+function emptyClaudeProfilesCache() {
+  return { byName: {}, byModel: new Map() };
 }
 
 function getCachedSessionMetadata(cacheKey, fingerprint) {
@@ -173,11 +227,40 @@ function invalidateMessageCache(cacheKey) {
   messageParseCache.delete(cacheKey);
 }
 
+function getRecentMessageCache(cacheKey, fingerprint) {
+  const cached = recentMessageCache.get(cacheKey);
+  if (!cached || cached.fingerprint !== fingerprint) return null;
+  recentMessageCache.delete(cacheKey);
+  recentMessageCache.set(cacheKey, cached);
+  return cached.result;
+}
+
+function setRecentMessageCache(cacheKey, fingerprint, result) {
+  if (recentMessageCache.has(cacheKey)) {
+    recentMessageCache.delete(cacheKey);
+  }
+  recentMessageCache.set(cacheKey, { fingerprint, result });
+
+  while (recentMessageCache.size > MESSAGE_CACHE_LIMIT) {
+    const firstKey = recentMessageCache.keys().next().value;
+    if (!firstKey) break;
+    recentMessageCache.delete(firstKey);
+  }
+}
+
+function invalidateRecentMessageCache(cacheKey) {
+  if (!cacheKey) return;
+  recentMessageCache.delete(cacheKey);
+}
+
 function buildProjectDigest(projects) {
   return projects.map((project) => ({
     dirName: project.dirName,
     sessionCount: project.sessionCount,
+    archivedSessionCount: project.archivedSessionCount || 0,
+    totalSessionCount: project.totalSessionCount || project.sessionCount || 0,
     latestModified: project.latestModified || 0,
+    latestVisibleModified: project.latestVisibleModified || 0,
     sourceCounts: project.sourceCounts || {},
   }));
 }
@@ -187,11 +270,100 @@ function buildSessionDigest(sessions) {
     sessionId: session.sessionId,
     source: session.source,
     rawSessionId: session.rawSessionId || '',
+    forkedFromId: session.forkedFromId || '',
     modified: session.modified || '',
     messageCount: session.messageCount || 0,
     model: session.model || '',
     title: session.customTitle || session.firstPrompt || '',
+    archived: !!session.archived,
+    archivedAt: session.archivedAt || '',
   }));
+}
+
+function normalizeEpochTimestamp(value) {
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric) || numeric <= 0) return '';
+  const millis = numeric < 1e12 ? numeric * 1000 : numeric;
+  const date = new Date(millis);
+  return Number.isNaN(date.getTime()) ? '' : date.toISOString();
+}
+
+async function resolveCodexStateDbPath() {
+  if (codexStateDbPathResolved) return resolvedCodexStateDbPath;
+  codexStateDbPathResolved = true;
+
+  if (config.codexStateDbPath && existsSync(config.codexStateDbPath)) {
+    resolvedCodexStateDbPath = config.codexStateDbPath;
+    return resolvedCodexStateDbPath;
+  }
+
+  const codexHomeDir = path.dirname(config.codexSessionsDir);
+  try {
+    const entries = await fsp.readdir(codexHomeDir, { withFileTypes: true });
+    const candidates = entries
+      .filter((entry) => entry.isFile())
+      .map((entry) => {
+        const match = entry.name.match(/^state_(\d+)\.sqlite$/);
+        if (!match) return null;
+        return {
+          version: Number(match[1]),
+          filePath: path.join(codexHomeDir, entry.name),
+        };
+      })
+      .filter(Boolean)
+      .sort((a, b) => b.version - a.version);
+
+    resolvedCodexStateDbPath = candidates[0]?.filePath || '';
+  } catch {
+    resolvedCodexStateDbPath = '';
+  }
+
+  return resolvedCodexStateDbPath;
+}
+
+async function readCodexThreadStateMap() {
+  const dbPath = await resolveCodexStateDbPath();
+  if (!dbPath) return new Map();
+
+  try {
+    const { stdout } = await execFileAsync(
+      'sqlite3',
+      [
+        '-readonly',
+        '-tabs',
+        dbPath,
+        "SELECT id, archived, COALESCE(archived_at, '') FROM threads;",
+      ],
+      {
+        maxBuffer: 1024 * 1024 * 8,
+      },
+    );
+
+    const result = new Map();
+    for (const rawLine of stdout.split(/\r?\n/)) {
+      const line = rawLine.trim();
+      if (!line) continue;
+      const [id, archivedValue, archivedAtValue] = line.split('\t');
+      if (!id) continue;
+      result.set(id, {
+        archived: archivedValue === '1',
+        archivedAt: normalizeEpochTimestamp(archivedAtValue),
+      });
+    }
+    return result;
+  } catch {
+    return new Map();
+  }
+}
+
+function applyCodexThreadState(session, threadStateMap) {
+  if (!session) return session;
+  const threadState = threadStateMap.get(session.rawSessionId || '');
+  return {
+    ...session,
+    archived: !!threadState?.archived,
+    archivedAt: threadState?.archivedAt || '',
+  };
 }
 
 async function ensureClaudeProvenanceLoaded() {
@@ -216,14 +388,7 @@ function parseClaudeModelsJson(raw) {
     const env = entry?.env && typeof entry.env === 'object' ? entry.env : {};
     const anthropicModel = env.ANTHROPIC_MODEL || '';
     const baseUrl = env.ANTHROPIC_BASE_URL || '';
-    const label = name === 'aliyun' ? 'ALIYUN'
-      : name === 'cliproxy' ? 'CLIPROXY'
-      : name === 'gpt' ? 'GPT'
-      : name === 'deepseek' ? 'DEEPSEEK'
-      : name === 'openrouter' ? 'OPENROUTER'
-      : name === 'sii' ? 'SII'
-      : name === 'fujie' ? 'FUJIE'
-      : name.toUpperCase();
+    const label = name.toUpperCase();
     byName[name] = {
       name,
       label,
@@ -241,27 +406,34 @@ function parseClaudeModelsJson(raw) {
 }
 
 function preferredClaudeProfileForModel(model) {
-  const value = (model || '').toLowerCase();
-  if (!value) return '';
-  if (value.includes('kimi')) return 'aliyun';
-  if (value.includes('gpt-5.4')) return 'gpt';
-  if (value.includes('deepseek')) return 'deepseek';
-  if (value.includes('claude-sonnet') || value.includes('claude-opus') || value.includes('claude-haiku')) {
-    return 'cliproxy';
-  }
+  // Override this function or configure profile-model mappings in your .models.json
+  // to automatically select a profile based on the model string.
   return '';
 }
 
 async function ensureClaudeProfilesLoaded() {
-  if (claudeProfilesLoaded) return;
-  claudeProfilesLoaded = true;
   try {
     const realProjectsDir = await fsp.realpath(config.claudeProjectsDir);
     const modelsFile = path.join(path.dirname(path.dirname(realProjectsDir)), '.models.json');
+    const stat = await fsp.stat(modelsFile);
+    const fingerprint = buildFileFingerprint(stat);
+
+    if (
+      claudeProfilesCache &&
+      claudeProfilesFilePath === modelsFile &&
+      claudeProfilesFingerprint === fingerprint
+    ) {
+      return;
+    }
+
     const raw = await fsp.readFile(modelsFile, 'utf-8');
     claudeProfilesCache = parseClaudeModelsJson(raw);
+    claudeProfilesFilePath = modelsFile;
+    claudeProfilesFingerprint = fingerprint;
   } catch {
-    claudeProfilesCache = { byName: {}, byModel: new Map() };
+    claudeProfilesCache = emptyClaudeProfilesCache();
+    claudeProfilesFilePath = '';
+    claudeProfilesFingerprint = '';
   }
 }
 
@@ -433,6 +605,10 @@ function normalizeText(value) {
   return JSON.stringify(value);
 }
 
+function hasNonEmptyText(value) {
+  return normalizeText(value).trim().length > 0;
+}
+
 function extractClaudePlainText(content) {
   if (typeof content === 'string') return content;
   if (Array.isArray(content)) {
@@ -445,9 +621,26 @@ function extractClaudePlainText(content) {
 }
 
 function extractTaggedBlock(text, tag) {
-  if (typeof text !== 'string') return '';
-  const match = text.match(new RegExp(`<${tag}>([\\s\\S]*?)</${tag}>`, 'i'));
-  return match ? match[1].trim() : '';
+  if (typeof text !== 'string' || typeof tag !== 'string' || !tag) return '';
+  const lowerText = text.toLowerCase();
+  const openTag = `<${tag}>`;
+  const closeTag = `</${tag}>`;
+  const lowerOpenTag = openTag.toLowerCase();
+  const lowerCloseTag = closeTag.toLowerCase();
+  const startIndex = lowerText.indexOf(lowerOpenTag);
+  if (startIndex === -1) return '';
+  const contentStart = startIndex + openTag.length;
+  const endIndex = lowerText.indexOf(lowerCloseTag, contentStart);
+  if (endIndex === -1) return '';
+  return text.slice(contentStart, endIndex).trim();
+}
+
+function isClaudeSyntheticPrompt(text) {
+  const prompt = typeof text === 'string' ? text.trim() : '';
+  if (!prompt) return false;
+  return prompt === CLAUDE_SYNTHETIC_WARMUP_PROMPT
+    || prompt.startsWith(CLAUDE_SYNTHETIC_SUMMARY_PREFIX)
+    || prompt.startsWith(CLAUDE_SYNTHETIC_JUDGE_PREFIX);
 }
 
 function parseClaudeWrapper(text) {
@@ -548,7 +741,49 @@ function normalizeProjectPath(projectPath) {
   if (typeof projectPath !== 'string' || !projectPath.trim()) {
     return '(unknown)';
   }
-  return projectPath.trim();
+  const trimmed = projectPath.trim().replace(/\/+$/, '');
+  if (!trimmed) return '(unknown)';
+  return resolveProjectPathAlias(trimmed);
+}
+
+function resolveProjectPathAlias(projectPath) {
+  if (!projectPath || projectPath === '(unknown)') return '(unknown)';
+  if (existsSync(projectPath)) return projectPath;
+
+  const parts = projectPath.split('/').filter(Boolean);
+  if (!parts.length) return projectPath;
+
+  const queue = [parts];
+  const seen = new Set([parts.join('/')]);
+  let steps = 0;
+  const maxStates = 256;
+
+  while (queue.length && steps < maxStates) {
+    const current = queue.shift();
+    steps++;
+    const candidatePath = '/' + current.join('/');
+    if (existsSync(candidatePath)) {
+      return candidatePath;
+    }
+
+    if (current.length < 2) continue;
+
+    for (let i = 0; i < current.length - 1; i++) {
+      for (const joiner of ['_', '-']) {
+        const merged = [
+          ...current.slice(0, i),
+          `${current[i]}${joiner}${current[i + 1]}`,
+          ...current.slice(i + 2),
+        ];
+        const key = merged.join('/');
+        if (seen.has(key)) continue;
+        seen.add(key);
+        queue.push(merged);
+      }
+    }
+  }
+
+  return projectPath;
 }
 
 async function pathExists(filePath) {
@@ -772,7 +1007,16 @@ async function collectClaudeSessions() {
       const fingerprint = buildFileFingerprint(fileStat, indexFingerprint);
       const cached = getCachedSessionMetadata(cacheKey, fingerprint);
       if (cached) {
-        sessions.push(cached);
+        const hydratedCached = {
+          ...cached,
+          fileSizeBytes: cached.fileSizeBytes || fileStat.size,
+        };
+        if (!Object.prototype.hasOwnProperty.call(cached, 'fileSizeBytes')) {
+          setCachedSessionMetadata(cacheKey, fingerprint, hydratedCached);
+        }
+        if (!isClaudeSyntheticPrompt(hydratedCached.firstPrompt)) {
+          sessions.push(hydratedCached);
+        }
         continue;
       }
 
@@ -821,6 +1065,7 @@ async function collectClaudeSessions() {
         modified,
         gitBranch,
         model,
+        fileSizeBytes: fileStat.size,
         sessionId: encodeToken({
           source: 'claude',
           projectPath,
@@ -830,7 +1075,9 @@ async function collectClaudeSessions() {
       };
 
       setCachedSessionMetadata(cacheKey, fingerprint, session);
-      sessions.push(session);
+      if (!isClaudeSyntheticPrompt(session.firstPrompt)) {
+        sessions.push(session);
+      }
     }
   }
 
@@ -852,22 +1099,75 @@ async function scanCodexMetadata(filePath) {
     let created = '';
     let gitBranch = '';
     let model = '';
+    let lastInputTokens = 0;
+    let lastCachedInputTokens = 0;
+    let lastOutputTokens = 0;
+    let lastUsedTokens = 0;
+    let totalInputTokens = 0;
+    let totalOutputTokens = 0;
+    let contextWindowTokens = 0;
+    let forkedFromId = '';
+    let sawPrimarySessionMeta = false;
 
     rl.on('line', (line) => {
       const obj = safeJsonParse(line);
       if (!obj) return;
 
       if (obj.type === 'session_meta') {
-        rawSessionId = obj.payload?.id || rawSessionId;
-        projectPath = obj.payload?.cwd || projectPath;
-        created = obj.payload?.timestamp || obj.timestamp || created;
-        model = obj.payload?.model || model;
+        // Forked/resumed Codex rollouts can include parent thread metadata
+        // after the new thread's own session_meta. Only the first one
+        // identifies the file's logical session.
+        if (!sawPrimarySessionMeta) {
+          rawSessionId = obj.payload?.id || rawSessionId;
+          forkedFromId = obj.payload?.forked_from_id || forkedFromId;
+          projectPath = obj.payload?.cwd || projectPath;
+          created = obj.payload?.timestamp || obj.timestamp || created;
+          model = obj.payload?.model || model;
+          sawPrimarySessionMeta = true;
+        }
         return;
       }
 
       if (obj.type === 'turn_context') {
         gitBranch = obj.payload?.git?.branch || gitBranch;
         model = obj.payload?.model || model;
+        return;
+      }
+
+      if (obj.type === 'event_msg' && obj.payload?.type === 'task_started') {
+        const windowSize = Number(obj.payload?.model_context_window ?? obj.payload?.modelContextWindow ?? 0);
+        if (Number.isFinite(windowSize) && windowSize > 0) {
+          contextWindowTokens = windowSize;
+        }
+        return;
+      }
+
+      if (obj.type === 'event_msg' && obj.payload?.type === 'token_count') {
+        const info = obj.payload?.info || null;
+        const usage = info?.last_token_usage || info?.lastTokenUsage || null;
+        const totalUsage = info?.total_token_usage || info?.totalTokenUsage || null;
+        const inputTokens = Number(usage?.input_tokens ?? usage?.inputTokens ?? 0);
+        const cachedInputTokens = Number(usage?.cached_input_tokens ?? usage?.cachedInputTokens ?? 0);
+        const outputTokens = Number(usage?.output_tokens ?? usage?.outputTokens ?? 0);
+        const usedTokens = Number(usage?.total_tokens ?? usage?.totalTokens ?? (inputTokens + outputTokens));
+        const totalInput = Number(totalUsage?.input_tokens ?? totalUsage?.inputTokens ?? 0);
+        const totalOutput = Number(totalUsage?.output_tokens ?? totalUsage?.outputTokens ?? 0);
+        const windowSize = Number(info?.model_context_window ?? info?.modelContextWindow ?? 0);
+        if (Number.isFinite(inputTokens) && inputTokens > 0) {
+          lastInputTokens = inputTokens;
+          lastCachedInputTokens = Number.isFinite(cachedInputTokens) ? cachedInputTokens : 0;
+          lastOutputTokens = Number.isFinite(outputTokens) ? outputTokens : 0;
+          lastUsedTokens = Number.isFinite(usedTokens) ? usedTokens : (inputTokens + outputTokens);
+        }
+        if (Number.isFinite(totalInput) && totalInput > 0) {
+          totalInputTokens = totalInput;
+        }
+        if (Number.isFinite(totalOutput) && totalOutput >= 0) {
+          totalOutputTokens = totalOutput;
+        }
+        if (Number.isFinite(windowSize) && windowSize > 0) {
+          contextWindowTokens = windowSize;
+        }
         return;
       }
 
@@ -890,12 +1190,20 @@ async function scanCodexMetadata(filePath) {
     rl.on('close', () => {
       resolve({
         rawSessionId,
+        forkedFromId,
         projectPath: normalizeProjectPath(projectPath),
         firstPrompt,
         messageCount,
         created,
         gitBranch,
         model,
+        lastInputTokens,
+        lastCachedInputTokens,
+        lastOutputTokens,
+        lastUsedTokens,
+        totalInputTokens,
+        totalOutputTokens,
+        contextWindowTokens,
       });
     });
     rl.on('error', reject);
@@ -907,6 +1215,7 @@ async function collectCodexSessions() {
     config.codexSessionsDir,
     (filePath) => filePath.endsWith('.jsonl')
   );
+  const threadStateMap = await readCodexThreadStateMap();
 
   const sessions = [];
 
@@ -920,23 +1229,51 @@ async function collectCodexSessions() {
 
     const cacheKey = buildSessionMetadataCacheKey('codex', filePath);
     const fingerprint = buildFileFingerprint(fileStat);
+    const relativePath = path.relative(config.codexSessionsDir, filePath);
     const cached = getCachedSessionMetadata(cacheKey, fingerprint);
     if (cached) {
-      sessions.push(cached);
+      const projectPath = normalizeProjectPath(cached.projectPath);
+      const rawSessionId = cached.rawSessionId || path.basename(filePath, '.jsonl');
+      const hydratedCached = {
+        ...cached,
+        source: 'codex',
+        sourceLabel: SOURCE_META.codex.label,
+        sourceShortLabel: SOURCE_META.codex.shortLabel,
+        projectPath,
+        projectName: displayNameFromPath(projectPath),
+        rawSessionId,
+        forkedFromId: cached.forkedFromId || '',
+        fileSizeBytes: cached.fileSizeBytes || fileStat.size,
+        lastInputTokens: cached.lastInputTokens || 0,
+        lastCachedInputTokens: cached.lastCachedInputTokens || 0,
+        lastOutputTokens: cached.lastOutputTokens || 0,
+        lastUsedTokens: cached.lastUsedTokens || 0,
+        totalInputTokens: cached.totalInputTokens || 0,
+        totalOutputTokens: cached.totalOutputTokens || 0,
+        contextWindowTokens: cached.contextWindowTokens || 0,
+        sessionId: encodeToken({
+          source: 'codex',
+          projectPath,
+          relativePath,
+          rawSessionId,
+        }),
+      };
+      setCachedSessionMetadata(cacheKey, fingerprint, hydratedCached);
+      sessions.push(applyCodexThreadState(hydratedCached, threadStateMap));
       continue;
     }
 
     const metadata = await scanCodexMetadata(filePath);
-    const relativePath = path.relative(config.codexSessionsDir, filePath);
     const projectPath = normalizeProjectPath(metadata.projectPath);
 
-    const session = {
+    const baseSession = {
       source: 'codex',
       sourceLabel: SOURCE_META.codex.label,
       sourceShortLabel: SOURCE_META.codex.shortLabel,
       projectPath,
       projectName: displayNameFromPath(projectPath),
       rawSessionId: metadata.rawSessionId,
+      forkedFromId: metadata.forkedFromId || '',
       firstPrompt: metadata.firstPrompt,
       summary: '',
       messageCount: metadata.messageCount,
@@ -944,6 +1281,14 @@ async function collectCodexSessions() {
       modified: fileStat.mtime.toISOString(),
       gitBranch: metadata.gitBranch || '',
       model: metadata.model || '',
+      fileSizeBytes: fileStat.size,
+      lastInputTokens: metadata.lastInputTokens || 0,
+      lastCachedInputTokens: metadata.lastCachedInputTokens || 0,
+      lastOutputTokens: metadata.lastOutputTokens || 0,
+      lastUsedTokens: metadata.lastUsedTokens || 0,
+      totalInputTokens: metadata.totalInputTokens || 0,
+      totalOutputTokens: metadata.totalOutputTokens || 0,
+      contextWindowTokens: metadata.contextWindowTokens || 0,
       sessionId: encodeToken({
         source: 'codex',
         projectPath,
@@ -952,11 +1297,45 @@ async function collectCodexSessions() {
       }),
     };
 
-    setCachedSessionMetadata(cacheKey, fingerprint, session);
-    sessions.push(session);
+    setCachedSessionMetadata(cacheKey, fingerprint, baseSession);
+    sessions.push(applyCodexThreadState(baseSession, threadStateMap));
   }
 
-  return sessions;
+  return dedupeCodexSessions(sessions);
+}
+
+function choosePreferredCodexSession(current, candidate) {
+  if (!current) return candidate;
+
+  const currentModified = current.modified ? new Date(current.modified).getTime() : 0;
+  const candidateModified = candidate.modified ? new Date(candidate.modified).getTime() : 0;
+  if (candidateModified !== currentModified) {
+    return candidateModified > currentModified ? candidate : current;
+  }
+
+  const currentMessageCount = current.messageCount || 0;
+  const candidateMessageCount = candidate.messageCount || 0;
+  if (candidateMessageCount !== currentMessageCount) {
+    return candidateMessageCount > currentMessageCount ? candidate : current;
+  }
+
+  return candidate;
+}
+
+function dedupeCodexSessions(sessions) {
+  const deduped = new Map();
+
+  for (const session of sessions) {
+    const key = JSON.stringify({
+      source: session.source,
+      projectPath: normalizeProjectPath(session.projectPath),
+      rawSessionId: session.rawSessionId || '',
+    });
+    const existing = deduped.get(key);
+    deduped.set(key, choosePreferredCodexSession(existing, session));
+  }
+
+  return Array.from(deduped.values());
 }
 
 function extractCopilotModel(message) {
@@ -1066,7 +1445,14 @@ async function collectCopilotSessions() {
     const fingerprint = buildFileFingerprint(fileStat, workspaceFingerprint);
     const cached = getCachedSessionMetadata(cacheKey, fingerprint);
     if (cached) {
-      sessions.push(cached);
+      const hydratedCached = {
+        ...cached,
+        fileSizeBytes: cached.fileSizeBytes || fileStat.size,
+      };
+      if (!Object.prototype.hasOwnProperty.call(cached, 'fileSizeBytes')) {
+        setCachedSessionMetadata(cacheKey, fingerprint, hydratedCached);
+      }
+      sessions.push(hydratedCached);
       continue;
     }
 
@@ -1087,6 +1473,7 @@ async function collectCopilotSessions() {
       modified: workspaceInfo.updated_at || fileStat.mtime.toISOString(),
       gitBranch: metadata.gitBranch || '',
       model: metadata.model || '',
+      fileSizeBytes: fileStat.size,
       sessionId: encodeToken({
         source: 'copilot',
         projectPath,
@@ -1153,16 +1540,39 @@ async function buildSessionsSnapshot() {
   return snapshot;
 }
 
+function startSessionsSnapshotRefresh() {
+  if (sessionsSnapshotRefreshPromise) {
+    return sessionsSnapshotRefreshPromise;
+  }
+
+  sessionsSnapshotRefreshPromise = buildSessionsSnapshot()
+    .finally(() => {
+      sessionsSnapshotRefreshPromise = null;
+    });
+
+  return sessionsSnapshotRefreshPromise;
+}
+
+function refreshSessionsSnapshotInBackground() {
+  startSessionsSnapshotRefresh().catch((err) => {
+    console.error('[session-dashboard] background snapshot refresh failed', err);
+  });
+}
+
 async function getSessionsSnapshot(force = false) {
-  if (
-    !force &&
-    sessionsSnapshotCache &&
-    Date.now() - sessionsSnapshotCache.builtAt < SESSION_SNAPSHOT_TTL_MS
-  ) {
+  if (force) {
+    return startSessionsSnapshotRefresh();
+  }
+
+  if (sessionsSnapshotCache) {
+    if (Date.now() - sessionsSnapshotCache.builtAt < SESSION_SNAPSHOT_TTL_MS) {
+      return sessionsSnapshotCache;
+    }
+    refreshSessionsSnapshotInBackground();
     return sessionsSnapshotCache;
   }
 
-  return buildSessionsSnapshot();
+  return startSessionsSnapshotRefresh();
 }
 
 async function handleGetClaudeProfiles(req, res) {
@@ -1188,20 +1598,29 @@ function buildProjectRows(sessions) {
         dirName: encodeToken({ projectPath }),
         path: projectPath,
         sessionCount: 0,
+        archivedSessionCount: 0,
+        totalSessionCount: 0,
         sourceCounts: {},
         sources: [],
         latestModified: 0,
+        latestVisibleModified: 0,
       });
     }
 
     const row = projectMap.get(projectPath);
-    row.sessionCount++;
+    row.totalSessionCount++;
+    if (session.archived) {
+      row.archivedSessionCount++;
+    } else {
+      row.sessionCount++;
+    }
     row.sourceCounts[session.source] = (row.sourceCounts[session.source] || 0) + 1;
     row.sources = Object.keys(row.sourceCounts).sort();
-    row.latestModified = Math.max(
-      row.latestModified,
-      session.modified ? new Date(session.modified).getTime() : 0
-    );
+    const modifiedTime = session.modified ? new Date(session.modified).getTime() : 0;
+    row.latestModified = Math.max(row.latestModified, modifiedTime);
+    if (!session.archived) {
+      row.latestVisibleModified = Math.max(row.latestVisibleModified, modifiedTime);
+    }
   }
 
   return [...projectMap.values()].sort((a, b) => {
@@ -1246,35 +1665,65 @@ function buildDraftSession(projectPath, source) {
 
 function parseClaudeAssistantContent(content) {
   if (!content) return [];
-  if (typeof content === 'string') return [{ type: 'text', text: content }];
-  if (!Array.isArray(content)) return [{ type: 'text', text: JSON.stringify(content) }];
+  if (typeof content === 'string') {
+    return hasNonEmptyText(content) ? [{ type: 'text', text: content }] : [];
+  }
+  if (!Array.isArray(content)) {
+    const normalized = normalizeText(content);
+    return hasNonEmptyText(normalized) ? [{ type: 'text', text: normalized }] : [];
+  }
 
-  return content.map((block) => {
-    if (block.type === 'text') {
-      return { type: 'text', text: block.text || '' };
-    }
-    if (block.type === 'tool_use') {
-      const inputSummary = truncateText(
-        typeof block.input === 'string' ? block.input : JSON.stringify(block.input || {}),
-        1500
-      );
-      return { type: 'tool_use', name: block.name || 'unknown', input: inputSummary };
-    }
-    if (block.type === 'tool_result') {
-      const result = Array.isArray(block.content)
-        ? block.content
-            .filter((item) => item.type === 'text')
-            .map((item) => item.text || '')
-            .join('\n')
-        : normalizeText(block.content);
-      return {
-        type: 'tool_result',
-        tool_use_id: block.tool_use_id || '',
-        content: truncateText(result, 1500),
-      };
-    }
-    return { type: 'text', text: truncateText(JSON.stringify(block), 500) };
-  });
+  return content
+    .map((block) => {
+      if (!block || typeof block !== 'object') return null;
+
+      if (block.type === 'text') {
+        return hasNonEmptyText(block.text) ? { type: 'text', text: block.text || '' } : null;
+      }
+      if (block.type === 'thinking') {
+        const thinkingText = typeof block.thinking === 'string'
+          ? block.thinking
+          : normalizeText(block.thinking ?? block.text ?? block.content ?? '');
+        return hasNonEmptyText(thinkingText)
+          ? { type: 'thinking', text: thinkingText, signature: block.signature || '' }
+          : null;
+      }
+      if (block.type === 'redacted_thinking') {
+        const reason = typeof block.reason === 'string'
+          ? block.reason
+          : normalizeText(block.reason ?? block.data ?? '');
+        return {
+          type: 'redacted_thinking',
+          text: hasNonEmptyText(reason)
+            ? reason
+            : 'Reasoning content was redacted by the source session.',
+        };
+      }
+      if (block.type === 'tool_use') {
+        const inputSummary = truncateText(
+          typeof block.input === 'string' ? block.input : JSON.stringify(block.input || {}),
+          1500
+        );
+        return { type: 'tool_use', name: block.name || 'unknown', input: inputSummary };
+      }
+      if (block.type === 'tool_result') {
+        const result = Array.isArray(block.content)
+          ? block.content
+              .filter((item) => item.type === 'text')
+              .map((item) => item.text || '')
+              .join('\n')
+          : normalizeText(block.content);
+        return {
+          type: 'tool_result',
+          tool_use_id: block.tool_use_id || '',
+          content: truncateText(result, 1500),
+        };
+      }
+
+      const fallback = truncateText(JSON.stringify(block), 500);
+      return hasNonEmptyText(fallback) ? { type: 'text', text: fallback } : null;
+    })
+    .filter(Boolean);
 }
 
 function parseClaudeToolResults(content) {
@@ -1420,10 +1869,14 @@ async function parseClaudeMessages(filePath) {
       }
 
       if (effectiveType === 'assistant') {
+        const assistantContent = parseClaudeAssistantContent(content);
+        if (assistantContent.length === 0) {
+          return;
+        }
         messages.push({
           ...base,
           model: obj.message?.model || '',
-          content: parseClaudeAssistantContent(content),
+          content: assistantContent,
         });
         return;
       }
@@ -1535,6 +1988,155 @@ function parseCodexToolResultOutput(payload) {
   return normalizeText(payload.output);
 }
 
+
+function appendCodexMessageFromObject(obj, messages, state = {}) {
+  if (!obj || typeof obj !== 'object') return;
+
+  if (obj.type === 'turn_context') {
+    state.currentModel = obj.payload?.model || state.currentModel || state.fallbackModel || '';
+    return;
+  }
+
+  if (obj.type === 'event_msg' && obj.payload?.type === 'user_message') {
+    messages.push({
+      type: 'user',
+      source: 'codex',
+      sourceLabel: SOURCE_META.codex.label,
+      timestamp: obj.timestamp || '',
+      uuid: '',
+      content: normalizeText(obj.payload?.message),
+    });
+    return;
+  }
+
+  if (obj.type !== 'response_item') return;
+
+  const payload = obj.payload || {};
+  const timestamp = obj.timestamp || '';
+  const assistantModel = state.currentModel || state.fallbackModel || '';
+
+  if (payload.type === 'message' && payload.role === 'assistant') {
+    messages.push({
+      type: 'assistant',
+      source: 'codex',
+      sourceLabel: SOURCE_META.codex.label,
+      timestamp,
+      uuid: '',
+      model: assistantModel,
+      roleLabel: 'CODEX',
+      content: parseCodexAssistantBlocks(payload.content),
+    });
+    return;
+  }
+
+  if (payload.type === 'function_call') {
+    messages.push(
+      makeAssistantToolMessage(
+        'codex',
+        timestamp,
+        payload.call_id || '',
+        'CODEX',
+        payload.name,
+        payload.arguments
+      )
+    );
+    return;
+  }
+
+  if (payload.type === 'custom_tool_call') {
+    messages.push(
+      makeAssistantToolMessage(
+        'codex',
+        timestamp,
+        payload.call_id || '',
+        'CODEX',
+        payload.name,
+        payload.input
+      )
+    );
+    return;
+  }
+
+  if (payload.type === 'web_search_call') {
+    const searchInput =
+      payload.action?.query ||
+      payload.action?.queries ||
+      payload.action ||
+      '';
+    messages.push(
+      makeAssistantToolMessage(
+        'codex',
+        timestamp,
+        payload.call_id || '',
+        'CODEX',
+        'web_search',
+        searchInput
+      )
+    );
+    return;
+  }
+
+  if (payload.type === 'function_call_output' || payload.type === 'custom_tool_call_output') {
+    messages.push(
+      makeToolResultMessage(
+        'codex',
+        timestamp,
+        payload.call_id || '',
+        parseCodexToolResultOutput(payload)
+      )
+    );
+  }
+}
+
+async function readTailLines(filePath, lineCount) {
+  const { stdout } = await execFileAsync(
+    'tail',
+    ['-n', String(lineCount), filePath],
+    { maxBuffer: 64 * 1024 * 1024 }
+  );
+  return stdout || '';
+}
+
+async function loadRecentCodexMessages(filePath, limit) {
+  let lineCount = Math.max(RECENT_TAIL_LINES_INITIAL, limit * 40);
+
+  while (lineCount <= RECENT_TAIL_LINES_MAX) {
+    let tailOutput = '';
+    try {
+      tailOutput = await readTailLines(filePath, lineCount);
+    } catch {
+      return null;
+    }
+
+    if (!tailOutput) {
+      return { messages: [], total: 0, hasMore: false };
+    }
+
+    const rawLines = tailOutput.split(/\r?\n/).filter(Boolean);
+    const messages = [];
+    const state = { currentModel: '', fallbackModel: '' };
+
+    for (const rawLine of rawLines) {
+      const obj = safeJsonParse(rawLine);
+      if (!obj) continue;
+      appendCodexMessageFromObject(obj, messages, state);
+    }
+
+    if (messages.length >= limit || rawLines.length < lineCount || lineCount >= RECENT_TAIL_LINES_MAX) {
+      const sliced = messages.slice(-limit);
+      const reachedStart = rawLines.length < lineCount;
+      return {
+        messages: sliced,
+        total: reachedStart ? messages.length : null,
+        hasMore: reachedStart ? messages.length > sliced.length : true,
+      };
+    }
+
+    lineCount = Math.min(lineCount * 2, RECENT_TAIL_LINES_MAX);
+  }
+
+  return null;
+}
 async function parseCodexMessages(filePath) {
   return new Promise((resolve, reject) => {
     const rl = readline.createInterface({
@@ -1543,112 +2145,18 @@ async function parseCodexMessages(filePath) {
     });
 
     const messages = [];
-    let currentModel = '';
+    const state = { currentModel: '', fallbackModel: '' };
 
     rl.on('line', (line) => {
       const obj = safeJsonParse(line);
       if (!obj) return;
-
-      if (obj.type === 'turn_context') {
-        currentModel = obj.payload?.model || currentModel;
-        return;
-      }
-
-      if (obj.type === 'event_msg' && obj.payload?.type === 'user_message') {
-        messages.push({
-          type: 'user',
-          source: 'codex',
-          sourceLabel: SOURCE_META.codex.label,
-          timestamp: obj.timestamp || '',
-          uuid: '',
-          content: normalizeText(obj.payload?.message),
-        });
-        return;
-      }
-
-      if (obj.type !== 'response_item') return;
-
-      const payload = obj.payload || {};
-      const timestamp = obj.timestamp || '';
-
-      if (payload.type === 'message' && payload.role === 'assistant') {
-        messages.push({
-          type: 'assistant',
-          source: 'codex',
-          sourceLabel: SOURCE_META.codex.label,
-          timestamp,
-          uuid: '',
-          model: currentModel,
-          roleLabel: 'CODEX',
-          content: parseCodexAssistantBlocks(payload.content),
-        });
-        return;
-      }
-
-      if (payload.type === 'function_call') {
-        messages.push(
-          makeAssistantToolMessage(
-            'codex',
-            timestamp,
-            payload.call_id || '',
-            'CODEX',
-            payload.name,
-            payload.arguments
-          )
-        );
-        return;
-      }
-
-      if (payload.type === 'custom_tool_call') {
-        messages.push(
-          makeAssistantToolMessage(
-            'codex',
-            timestamp,
-            payload.call_id || '',
-            'CODEX',
-            payload.name,
-            payload.input
-          )
-        );
-        return;
-      }
-
-      if (payload.type === 'web_search_call') {
-        const searchInput =
-          payload.action?.query ||
-          payload.action?.queries ||
-          payload.action ||
-          '';
-        messages.push(
-          makeAssistantToolMessage(
-            'codex',
-            timestamp,
-            payload.call_id || '',
-            'CODEX',
-            'web_search',
-            searchInput
-          )
-        );
-        return;
-      }
-
-      if (payload.type === 'function_call_output' || payload.type === 'custom_tool_call_output') {
-        messages.push(
-          makeToolResultMessage(
-            'codex',
-            timestamp,
-            payload.call_id || '',
-            parseCodexToolResultOutput(payload)
-          )
-        );
-      }
+      appendCodexMessageFromObject(obj, messages, state);
     });
 
     rl.on('close', () => resolve(messages));
     rl.on('error', reject);
   });
 }
-
 async function parseCopilotMessages(eventsPath) {
   return new Promise((resolve, reject) => {
     const rl = readline.createInterface({
@@ -1743,6 +2251,38 @@ async function parseCopilotMessages(eventsPath) {
     rl.on('close', () => resolve(messages));
     rl.on('error', reject);
   });
+}
+
+async function loadRecentMessagesForLocator(locator, limit = 50) {
+  if (!locator || locator.source !== 'codex') return null;
+
+  const storage = resolveSessionStorage(locator);
+  const filePath = storage?.filePath;
+  if (!filePath) return null;
+
+  let stat;
+  try {
+    stat = await fsp.stat(filePath);
+  } catch {
+    return null;
+  }
+
+  if (stat.size < LARGE_SESSION_FAST_PATH_BYTES) {
+    return null;
+  }
+
+  const cacheKey = buildSessionMetadataCacheKey(`${locator.source}-recent:${limit}`, filePath);
+  const fingerprint = buildFileFingerprint(stat);
+  const cached = getRecentMessageCache(cacheKey, fingerprint);
+  if (cached) {
+    return cached;
+  }
+
+  const recent = await loadRecentCodexMessages(filePath, limit);
+  if (recent) {
+    setRecentMessageCache(cacheKey, fingerprint, recent);
+  }
+  return recent;
 }
 
 async function loadMessagesForLocator(locator) {
@@ -1877,6 +2417,7 @@ async function handleDeleteSession(req, res, projectToken, sessionToken) {
     if (storage.filePath) {
       sessionMetadataCache.delete(buildSessionMetadataCacheKey(storage.source, storage.filePath));
       invalidateMessageCache(buildSessionMetadataCacheKey(`${storage.source}-messages`, storage.filePath));
+      invalidateRecentMessageCache(buildSessionMetadataCacheKey(`${storage.source}-recent:50`, storage.filePath));
       sessionMetadataCacheDirty = true;
     }
     invalidateSessionsSnapshotCache();
@@ -1961,6 +2502,14 @@ async function handleGetMessages(req, res, projectToken, sessionToken, query) {
   const direction = query.get('direction') || 'newest';
 
   try {
+    if (direction === 'newest' && offset === 0) {
+      const recent = await loadRecentMessagesForLocator(locator, limit);
+      if (recent) {
+        sendJSON(res, recent);
+        return;
+      }
+    }
+
     const allMessages = await loadMessagesForLocator(locator);
     const total = allMessages.length;
 
@@ -2004,7 +2553,7 @@ async function handleCreateDraftSession(req, res, projectToken) {
 
   const body = safeJsonParse(raw || '{}') || {};
   const source = typeof body.source === 'string' ? body.source : '';
-  const capabilities = await getInteractionCapabilities(config);
+  const capabilities = await getInteractionCapabilities();
   if (!capabilities[source]?.enabled) {
     sendError(res, `Source unavailable: ${source}`, 400);
     return;
@@ -2096,6 +2645,23 @@ async function handleRequest(req, res) {
   const urlObj = new URL(req.url, `http://localhost:${config.port}`);
   const pathname = urlObj.pathname;
   const query = urlObj.searchParams;
+  const corsHeaders = pathname.startsWith('/api/') ? buildCorsHeaders(req) : null;
+
+  if (corsHeaders) {
+    for (const [key, value] of Object.entries(corsHeaders)) {
+      res.setHeader(key, value);
+    }
+  }
+
+  if (pathname.startsWith('/api/') && req.method === 'OPTIONS') {
+    res.writeHead(204, { 'Content-Length': '0' });
+    res.end();
+    return;
+  }
+
+  if (pathname === '/api/health' && req.method === 'GET') {
+    return sendJSON(res, buildHealthPayload());
+  }
 
   if (pathname === '/api/capabilities' && req.method === 'GET') {
     return sendJSON(res, await getInteractionCapabilities(config));
@@ -2180,6 +2746,37 @@ async function handleRequest(req, res) {
 }
 
 const server = http.createServer(handleRequest);
+
+server.on('error', (err) => {
+  console.error('[session-dashboard] server error', err);
+});
+
+let shuttingDown = false;
+
+function shutdown(signal) {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  console.log(`[session-dashboard] received ${signal}, shutting down`);
+  server.close(() => {
+    process.exit(0);
+  });
+
+  setTimeout(() => {
+    console.error('[session-dashboard] forced shutdown after timeout');
+    process.exit(1);
+  }, 5000).unref?.();
+}
+
+process.on('SIGTERM', () => shutdown('SIGTERM'));
+process.on('SIGINT', () => shutdown('SIGINT'));
+process.on('uncaughtException', (err) => {
+  console.error('[session-dashboard] uncaught exception', err);
+  process.exit(1);
+});
+process.on('unhandledRejection', (reason) => {
+  console.error('[session-dashboard] unhandled rejection', reason);
+  process.exit(1);
+});
 
 server.listen(config.port, () => {
   const banner = `

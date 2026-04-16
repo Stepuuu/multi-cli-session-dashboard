@@ -2,10 +2,13 @@
 
 let composerCapabilities = null;
 let composerClaudeProfiles = [];
+let composerClaudeProfilesLoadedAt = 0;
+let composerClaudeProfilesPromise = null;
 let composerAttachments = [];
 let composerSelection = { project: null, session: null, sessionMeta: null };
 let composerTransientCounter = 0;
 const COMPOSER_MAX_HEIGHT = 260;
+const COMPOSER_CLAUDE_PROFILE_TTL_MS = 15000;
 
 const composerSendingSessions = new Set();
 const composerStatusBySession = new Map();
@@ -14,9 +17,17 @@ const composerImageStateBySession = new Map();
 const composerControllersBySession = new Map();
 const composerClaudeProfileOverrideBySession = new Map();
 const composerLatestInteractionTokenBySession = new Map();
+const composerActivityEntriesBySession = new Map();
+const composerActivityHideTimersBySession = new Map();
+const composerActivityExpandedSessions = new Set();
 
 function composerEl(id) {
   return document.getElementById(id);
+}
+
+function composerFetch(url, options = {}) {
+  const sharedFetch = typeof window.__dashboardFetch === 'function' ? window.__dashboardFetch : fetch;
+  return sharedFetch(url, options);
 }
 
 function currentSessionId() {
@@ -30,6 +41,23 @@ function currentSessionMeta() {
 function currentCapability() {
   const source = composerSelection.sessionMeta && composerSelection.sessionMeta.source;
   return source && composerCapabilities ? composerCapabilities[source] : null;
+}
+
+function normalizeComposerErrorMessage(errorLike) {
+  const asError = errorLike instanceof Error
+    ? errorLike
+    : new Error(typeof errorLike === 'string' ? errorLike : '');
+  const backendUnavailable = typeof window.__dashboardIsBackendUnavailableError === 'function'
+    && window.__dashboardIsBackendUnavailableError(asError);
+
+  if (backendUnavailable && typeof window.__dashboardBackendUnavailableMessage === 'function') {
+    return window.__dashboardBackendUnavailableMessage();
+  }
+
+  const message = typeof errorLike === 'string'
+    ? errorLike
+    : (typeof errorLike?.message === 'string' ? errorLike.message : '');
+  return message || 'Interaction failed.';
 }
 
 function currentClaudeProfileOverride() {
@@ -156,6 +184,94 @@ function renderImageStateBar() {
   `;
 }
 
+function getComposerActivityEntries(sessionId) {
+  return composerActivityEntriesBySession.get(sessionId) || [];
+}
+
+function pushComposerActivityEntry(sessionId, type, text) {
+  if (!sessionId || !text) return;
+  clearComposerActivityHideTimer(sessionId);
+  const next = [...getComposerActivityEntries(sessionId), {
+    id: nextTransientId(),
+    type,
+    text,
+    timestamp: new Date().toISOString(),
+  }].slice(-12);
+  composerActivityEntriesBySession.set(sessionId, next);
+  if (sessionId === currentSessionId()) {
+    renderComposerActivityLog();
+  }
+}
+
+function clearComposerActivityEntries(sessionId) {
+  composerActivityEntriesBySession.delete(sessionId);
+  if (sessionId === currentSessionId()) {
+    renderComposerActivityLog();
+  }
+}
+
+function clearComposerActivityHideTimer(sessionId) {
+  const timer = composerActivityHideTimersBySession.get(sessionId);
+  if (timer) {
+    clearTimeout(timer);
+    composerActivityHideTimersBySession.delete(sessionId);
+  }
+}
+
+function isComposerActivityExpanded(sessionId) {
+  return composerActivityExpandedSessions.has(sessionId);
+}
+
+function toggleComposerActivityExpanded(sessionId = currentSessionId()) {
+  if (!sessionId) return;
+  if (composerActivityExpandedSessions.has(sessionId)) {
+    composerActivityExpandedSessions.delete(sessionId);
+  } else {
+    composerActivityExpandedSessions.add(sessionId);
+    clearComposerActivityHideTimer(sessionId);
+  }
+  renderComposerActivityLog();
+}
+
+function scheduleComposerActivityHide(sessionId, delayMs = 1800) {
+  if (isComposerActivityExpanded(sessionId)) return;
+  clearComposerActivityHideTimer(sessionId);
+  const timer = setTimeout(() => {
+    composerActivityEntriesBySession.delete(sessionId);
+    composerActivityHideTimersBySession.delete(sessionId);
+    if (sessionId === currentSessionId()) {
+      renderComposerActivityLog();
+    }
+  }, delayMs);
+  composerActivityHideTimersBySession.set(sessionId, timer);
+}
+
+function renderComposerActivityLog() {
+  const shell = composerEl('composer-activity-shell');
+  const title = composerEl('composer-activity-title');
+  const container = composerEl('composer-activity-log');
+  if (!container || !shell || !title) return;
+
+  const sessionId = currentSessionId();
+  const expanded = isComposerActivityExpanded(sessionId);
+  const items = getComposerActivityEntries(sessionId);
+  if (!items.length) {
+    shell.classList.add('is-hidden');
+    shell.classList.remove('is-expanded');
+    title.textContent = 'LIVE ACTIVITY';
+    container.innerHTML = '<div class="composer-activity-empty">No live activity yet.</div>';
+    return;
+  }
+
+  shell.classList.remove('is-hidden');
+  shell.classList.toggle('is-expanded', expanded);
+  title.textContent = expanded ? 'LIVE ACTIVITY · Collapse' : 'LIVE ACTIVITY · Expand';
+  container.innerHTML = items.map((item) => `
+    <div class="composer-activity-entry ${escapeHtml(item.type)}">${escapeHtml(item.text)}</div>
+  `).join('');
+  container.scrollTop = container.scrollHeight;
+}
+
 function getTransientMessages(sessionId) {
   return composerTransientMessagesBySession.get(sessionId) || [];
 }
@@ -192,6 +308,16 @@ function markAllTransientNotLive(sessionId) {
   composerTransientMessagesBySession.set(sessionId, next);
 }
 
+function markAssistantTransientNotLive(sessionId) {
+  const next = getTransientMessages(sessionId).map((msg) => (
+    typeof msg._transientKind === 'string' && msg._transientKind.startsWith('assistant-live')
+      ? { ...msg, live: false, pending: false }
+      : msg
+  ));
+  composerTransientMessagesBySession.set(sessionId, next);
+  syncTransientTimelineForSession(sessionId);
+}
+
 function pushTransientMessageForSession(sessionId, sessionMeta, message) {
   const transientMessage = {
     timestamp: new Date().toISOString(),
@@ -215,18 +341,19 @@ function updateTransientMessageForSession(sessionId, id, patch) {
   syncTransientTimelineForSession(sessionId);
 }
 
-function ensureLiveAssistantMessage(sessionId, sessionMeta) {
-  const existing = getTransientMessages(sessionId).find((msg) => msg._transientKind === 'assistant-live');
+function ensureLiveAssistantMessage(sessionId, sessionMeta, itemId = '') {
+  const liveKind = itemId ? `assistant-live:${itemId}` : 'assistant-live';
+  const existing = getTransientMessages(sessionId).find((msg) => msg._transientKind === liveKind);
   if (existing) return existing._transientId;
 
-  markAllTransientNotLive(sessionId);
+  markAssistantTransientNotLive(sessionId);
   return pushTransientMessageForSession(sessionId, sessionMeta, {
     type: 'assistant',
     roleLabel: (sessionMeta && (sessionMeta.sourceLabel || sessionMeta.sourceShortLabel)) || 'ASSISTANT',
     content: '正在回复...',
     live: true,
     pending: true,
-    _transientKind: 'assistant-live',
+    _transientKind: liveKind,
   });
 }
 
@@ -249,6 +376,16 @@ function finalizeLiveMessages(sessionId) {
   }));
   composerTransientMessagesBySession.set(sessionId, next);
   syncTransientTimelineForSession(sessionId);
+}
+
+function appendTransientEventMessage(sessionId, sessionMeta, type, content) {
+  if (!content) return '';
+  return pushTransientMessageForSession(sessionId, sessionMeta, {
+    type,
+    content,
+    live: false,
+    pending: false,
+  });
 }
 
 function resetComposerAttachments() {
@@ -335,6 +472,7 @@ function renderComposer() {
   renderAttachments();
   renderClaudeProfileSelector();
   renderImageStateBar();
+  renderComposerActivityLog();
   autoResizeComposer();
 }
 
@@ -401,11 +539,20 @@ function consumeNdjsonChunk(buffer, handleEvent) {
   return rest;
 }
 
-function buildStreamEventHandler(sessionId, sessionMeta, requestState) {
+function scheduleFinalHydration(projectToken, sessionId, requestState) {
+  if (!sessionId || !requestState) return;
+  if (requestState.finalizeScheduled) return;
+  requestState.finalizeScheduled = true;
+  setTimeout(() => {
+    finalizeComposerHydration(projectToken, sessionId, requestState, requestState.interactionToken);
+  }, 300);
+}
+
+function buildStreamEventHandler(sessionId, sessionMeta, requestState, projectToken) {
   return function applyStreamEvent(event) {
     if (event.type === 'status') {
       setComposerStatusForSession(sessionId, event.message || 'Working...', false);
-      pushLiveStatusMessage(sessionId, sessionMeta, event.message || 'Working...', false, 'status');
+      pushComposerActivityEntry(sessionId, 'status', event.message || 'Working...');
       return;
     }
 
@@ -440,26 +587,21 @@ function buildStreamEventHandler(sessionId, sessionMeta, requestState) {
 
     if (event.type === 'tool_event') {
       setComposerStatusForSession(sessionId, event.message || 'Tool running...', false);
-      pushLiveStatusMessage(sessionId, sessionMeta, event.message || 'Tool running...', false, 'tool_event');
+      pushComposerActivityEntry(sessionId, 'tool', event.message || 'Tool running...');
+      appendTransientEventMessage(sessionId, sessionMeta, 'tool_event', event.message || 'Tool running...');
       return;
     }
 
     if (event.type === 'tool_result') {
       setComposerStatusForSession(sessionId, 'Tool completed.', false);
-      markAllTransientNotLive(sessionId);
-      pushTransientMessageForSession(sessionId, sessionMeta, {
-        type: 'tool_result',
-        content: event.message || '',
-        live: false,
-        pending: false,
-        _transientKind: 'tool-result',
-      });
+      pushComposerActivityEntry(sessionId, 'result', event.message || 'Tool completed.');
+      appendTransientEventMessage(sessionId, sessionMeta, 'tool_result', event.message || 'Tool completed.');
       return;
     }
 
     if (event.type === 'assistant_delta') {
       setComposerStatusForSession(sessionId, '正在回复...', false);
-      const messageId = ensureLiveAssistantMessage(sessionId, sessionMeta);
+      const messageId = ensureLiveAssistantMessage(sessionId, sessionMeta, event.itemId || '');
       const current = getTransientMessages(sessionId).find((msg) => msg._transientId === messageId);
       const currentText = typeof current?.content === 'string' && current.content !== '正在回复...'
         ? current.content
@@ -475,38 +617,54 @@ function buildStreamEventHandler(sessionId, sessionMeta, requestState) {
 
     if (event.type === 'assistant_final') {
       setComposerStatusForSession(sessionId, '已收到回复', false);
-      const existing = getTransientMessages(sessionId).find((msg) => msg._transientKind === 'assistant-live');
+      const liveKind = event.itemId ? `assistant-live:${event.itemId}` : 'assistant-live';
+      const existing = getTransientMessages(sessionId).find((msg) => msg._transientKind === liveKind);
+      const roleLabel = event.phase === 'commentary'
+        ? 'COMMENTARY'
+        : ((sessionMeta && (sessionMeta.sourceLabel || sessionMeta.sourceShortLabel)) || 'ASSISTANT');
       if (existing) {
         updateTransientMessageForSession(sessionId, existing._transientId, {
           content: event.text || existing.content,
           live: false,
           pending: false,
+          roleLabel,
           timestamp: new Date().toISOString(),
         });
       } else {
         pushTransientMessageForSession(sessionId, sessionMeta, {
           type: 'assistant',
-          roleLabel: (sessionMeta && (sessionMeta.sourceLabel || sessionMeta.sourceShortLabel)) || 'ASSISTANT',
+          roleLabel,
           content: event.text || '',
           live: false,
           pending: false,
         });
       }
+      if (sessionMeta?.source === 'claude') {
+        if (typeof window.__dashboardMarkSessionNeedsHydration === 'function') {
+          window.__dashboardMarkSessionNeedsHydration(sessionId);
+        }
+        scheduleFinalHydration(projectToken, sessionId, requestState);
+      }
       return;
     }
 
     if (event.type === 'error') {
-      setComposerStatusForSession(sessionId, event.message || 'Interaction failed.', true);
-      pushLiveStatusMessage(sessionId, sessionMeta, `Error: ${event.message || 'Interaction failed.'}`, true);
+      const message = normalizeComposerErrorMessage(event.message || 'Interaction failed.');
+      setComposerStatusForSession(sessionId, message, true);
+      pushComposerActivityEntry(sessionId, 'error', `Error: ${message}`);
+      scheduleComposerActivityHide(sessionId, 2600);
       return;
     }
 
     if (event.type === 'done') {
       finalizeLiveMessages(sessionId);
+      pushComposerActivityEntry(sessionId, 'status', 'Turn completed.');
       setComposerStatusForSession(sessionId, 'Done', false);
+      scheduleComposerActivityHide(sessionId, 1800);
       if (typeof window.__dashboardMarkSessionNeedsHydration === 'function') {
         window.__dashboardMarkSessionNeedsHydration(sessionId);
       }
+      scheduleFinalHydration(projectToken, sessionId, requestState);
     }
   }
 }
@@ -522,13 +680,8 @@ function stopComposerForSession(sessionId, options = {}) {
   }
   setComposerStatusForSession(sessionId, options.message || 'Stopped.', false);
   markAllTransientNotLive(sessionId);
-  pushTransientMessageForSession(sessionId, options.sessionMeta || currentSessionMeta(), {
-    type: 'status',
-    content: options.message || 'Stopped.',
-    live: false,
-    pending: false,
-    _transientKind: 'status-stopped',
-  });
+  pushComposerActivityEntry(sessionId, 'status', options.message || 'Stopped.');
+  scheduleComposerActivityHide(sessionId, 1400);
   renderComposer();
   controller.abort();
   return true;
@@ -580,6 +733,7 @@ async function submitInteraction({
     window.__dashboardSetSessionActivityState(sessionId, true, projectToken);
   }
   composerImageStateBySession.delete(sessionId);
+  clearComposerActivityEntries(sessionId);
   markAllTransientNotLive(sessionId);
   pushTransientMessageForSession(sessionId, sessionMeta, {
     type: 'user',
@@ -588,17 +742,17 @@ async function submitInteraction({
     live: false,
   });
   clearComposerInput();
-  pushLiveStatusMessage(sessionId, sessionMeta, '已发送，等待代理开始...', false);
+  pushComposerActivityEntry(sessionId, 'status', '已发送，等待代理开始...');
   setComposerStatusForSession(sessionId, 'Starting interaction...', false);
   renderComposer();
 
-  const requestState = { createdSession: null };
+  const requestState = { createdSession: null, interactionToken, finalizeScheduled: false };
 
   try {
-    const handleEvent = buildStreamEventHandler(sessionId, sessionMeta, requestState);
+    const handleEvent = buildStreamEventHandler(sessionId, sessionMeta, requestState, projectToken);
     const controller = new AbortController();
     composerControllersBySession.set(sessionId, controller);
-    const response = await fetch(
+    const response = await composerFetch(
       `/api/interact/${encodeURIComponent(projectToken)}/${encodeURIComponent(sessionToken)}`,
       {
         method: 'POST',
@@ -640,8 +794,9 @@ async function submitInteraction({
       await finalizeComposerHydration(projectToken, sessionId, requestState, interactionToken);
       return;
     }
-    setComposerStatusForSession(sessionId, err.message || 'Interaction failed.', true);
-    pushLiveStatusMessage(sessionId, sessionMeta, `Error: ${err.message || 'Interaction failed.'}`, true);
+    const message = normalizeComposerErrorMessage(err);
+    setComposerStatusForSession(sessionId, message, true);
+    pushComposerActivityEntry(sessionId, 'error', `Error: ${message}`);
     if (typeof window.__dashboardMarkSessionNeedsHydration === 'function') {
       window.__dashboardMarkSessionNeedsHydration(sessionId);
     }
@@ -688,39 +843,90 @@ async function submitComposer() {
   });
 }
 
+function loadComposerCapabilities() {
+  return composerFetch('/api/capabilities')
+    .then((res) => res.json())
+    .then((data) => {
+      composerCapabilities = data;
+      renderComposer();
+      return true;
+    })
+    .catch((err) => {
+      const message = normalizeComposerErrorMessage(err);
+      setComposerStatusForSession(currentSessionId(), message, true);
+      console.error(err);
+      return false;
+    });
+}
+
+function loadComposerClaudeProfiles(force = false) {
+  const now = Date.now();
+  if (!force && composerClaudeProfilesPromise) {
+    return composerClaudeProfilesPromise;
+  }
+  if (!force && composerClaudeProfilesLoadedAt && now - composerClaudeProfilesLoadedAt < COMPOSER_CLAUDE_PROFILE_TTL_MS) {
+    return Promise.resolve(true);
+  }
+
+  composerClaudeProfilesPromise = composerFetch('/api/claude-profiles')
+    .then((res) => res.json())
+    .then((data) => {
+      composerClaudeProfiles = Array.isArray(data) ? data : [];
+      composerClaudeProfilesLoadedAt = Date.now();
+      renderComposer();
+      return true;
+    })
+    .catch((err) => {
+      console.error(err);
+      return false;
+    })
+    .finally(() => {
+      composerClaudeProfilesPromise = null;
+    });
+
+  return composerClaudeProfilesPromise;
+}
+
 function initComposer() {
   const textarea = composerEl('composer-input');
   const sendBtn = composerEl('composer-send');
   const stopBtn = composerEl('composer-stop');
   const uploadBtn = composerEl('composer-upload');
   const uploadInput = composerEl('composer-image-input');
+  const activityHeader = composerEl('composer-activity-shell');
 
-  fetch('/api/capabilities')
-    .then((res) => res.json())
-    .then((data) => {
-      composerCapabilities = data;
-      renderComposer();
-    })
-    .catch((err) => {
-      setComposerStatusForSession(currentSessionId(), 'Failed to load interaction capabilities.', true);
-      console.error(err);
-    });
-
-  fetch('/api/claude-profiles')
-    .then((res) => res.json())
-    .then((data) => {
-      composerClaudeProfiles = Array.isArray(data) ? data : [];
-      renderComposer();
-    })
-    .catch((err) => {
-      console.error(err);
-    });
+  loadComposerCapabilities();
+  loadComposerClaudeProfiles();
 
   document.addEventListener('session:selected', (event) => {
     composerSelection = event.detail || { project: null, session: null, sessionMeta: null };
     composerAttachments = [];
+    syncTransientTimelineForSession(currentSessionId());
+    if (composerSelection.sessionMeta?.source === 'claude') {
+      loadComposerClaudeProfiles();
+    }
     renderComposer();
   });
+
+  document.addEventListener('dashboard:backend-health', (event) => {
+    if (!event.detail?.healthy) return;
+    loadComposerCapabilities();
+    loadComposerClaudeProfiles(true);
+  });
+
+  window.setInterval(() => {
+    if (currentSessionMeta()?.source !== 'claude') return;
+    loadComposerClaudeProfiles();
+  }, COMPOSER_CLAUDE_PROFILE_TTL_MS);
+
+  if (activityHeader) {
+    activityHeader.addEventListener('click', (event) => {
+      const removeTarget = event.target.closest('#composer-activity-log');
+      if (removeTarget) return;
+      if (!getComposerActivityEntries(currentSessionId()).length) return;
+      toggleComposerActivityExpanded(currentSessionId());
+    });
+  }
 
   uploadBtn.addEventListener('click', () => uploadInput.click());
   uploadInput.addEventListener('change', async () => {

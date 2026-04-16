@@ -3,13 +3,247 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta http-equiv="Cache-Control" content="no-store, max-age=0">
+  <meta http-equiv="Pragma" content="no-cache">
   <title>Session Dashboard</title>
-  <link rel="stylesheet" href="css/reset.css">
-  <link rel="stylesheet" href="css/theme.css">
-  <link rel="stylesheet" href="css/layout.css">
-  <link rel="stylesheet" href="css/components.css">
+  <style>
+    html, body {
+      height: 100%;
+      margin: 0;
+      overflow: hidden;
+    }
+
+    body {
+      background: #0d1117;
+      color: #e6edf3;
+      font-family: 'JetBrains Mono', 'Fira Code', 'Cascadia Code', monospace;
+    }
+
+    .app {
+      display: flex;
+      flex-direction: column;
+      min-height: 100vh;
+    }
+
+    .status-bar {
+      min-height: 32px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 0 16px;
+      border-bottom: 1px solid #30363d;
+      background: #161b22;
+    }
+
+    .panels {
+      flex: 1;
+      display: grid;
+      grid-template-columns: 200px 280px 1fr;
+      min-height: 0;
+    }
+
+    .panel {
+      min-width: 0;
+      overflow: auto;
+      border-right: 1px solid #30363d;
+      background: #161b22;
+    }
+
+    .panel:last-child {
+      border-right: none;
+      background: #0d1117;
+    }
+
+    .panel-header,
+    .chat-header,
+    .workspace-strip,
+    .composer-shell {
+      border-bottom: 1px solid #30363d;
+      padding: 10px 16px;
+    }
+
+    .chat-messages {
+      padding: 16px;
+    }
+
+    .empty-state {
+      color: #8b949e;
+      padding: 24px 16px;
+      line-height: 1.6;
+    }
+
+    .backend-status-banner {
+      display: none;
+    }
+
+    .boot-overlay {
+      position: fixed;
+      left: 16px;
+      right: 16px;
+      bottom: 16px;
+      z-index: 9999;
+      max-width: 900px;
+      padding: 12px 14px;
+      border: 1px solid rgba(88, 166, 255, 0.35);
+      border-radius: 10px;
+      background: rgba(13, 17, 23, 0.96);
+      box-shadow: 0 14px 36px rgba(0, 0, 0, 0.35);
+    }
+
+    .boot-overlay.is-hidden {
+      display: none;
+    }
+
+    .boot-overlay.is-error {
+      border-color: rgba(255, 123, 114, 0.5);
+    }
+
+    .boot-overlay.is-warn {
+      border-color: rgba(240, 136, 62, 0.5);
+    }
+
+    .boot-overlay-label {
+      color: #58a6ff;
+      font-size: 11px;
+      font-weight: 700;
+      letter-spacing: 0.12em;
+      text-transform: uppercase;
+    }
+
+    .boot-overlay.is-error .boot-overlay-label {
+      color: #ff7b72;
+    }
+
+    .boot-overlay.is-warn .boot-overlay-label {
+      color: #f0883e;
+    }
+
+    .boot-overlay-message {
+      margin-top: 6px;
+      font-size: 13px;
+      line-height: 1.5;
+    }
+
+    .boot-overlay-detail {
+      margin-top: 10px;
+      padding: 10px 12px;
+      white-space: pre-wrap;
+      word-break: break-word;
+      border-radius: 8px;
+      background: rgba(1, 4, 9, 0.75);
+      border: 1px solid rgba(48, 54, 61, 0.95);
+      color: #8b949e;
+      max-height: 240px;
+      overflow: auto;
+      font-size: 12px;
+      line-height: 1.45;
+    }
+
+    .boot-overlay-detail.is-hidden {
+      display: none;
+    }
+  </style>
+  <script>
+    (() => {
+      const STARTUP_TIMEOUT_MS = 8000;
+
+      function byId(id) {
+        return document.getElementById(id);
+      }
+
+      function showOverlay(kind, message, detail) {
+        const overlay = byId('boot-overlay');
+        const messageEl = byId('boot-overlay-message');
+        const detailEl = byId('boot-overlay-detail');
+        if (!overlay || !messageEl || !detailEl) return;
+
+        overlay.classList.remove('is-hidden', 'is-error', 'is-warn');
+        if (kind === 'error') {
+          overlay.classList.add('is-error');
+        } else if (kind === 'warn') {
+          overlay.classList.add('is-warn');
+        }
+
+        messageEl.textContent = message || 'Loading dashboard...';
+        if (detail) {
+          detailEl.textContent = detail;
+          detailEl.classList.remove('is-hidden');
+        } else {
+          detailEl.textContent = '';
+          detailEl.classList.add('is-hidden');
+        }
+      }
+
+      function hideOverlay() {
+        const overlay = byId('boot-overlay');
+        if (overlay) {
+          overlay.classList.add('is-hidden');
+          overlay.classList.remove('is-error', 'is-warn');
+        }
+      }
+
+      function report(kind, message, detail) {
+        showOverlay(kind, message, detail);
+      }
+
+      window.__dashboardSetBootstrapMessage = (message) => {
+        if (window.__dashboardBootCompleted) return;
+        report('info', message || 'Loading dashboard...');
+      };
+
+      window.__dashboardMarkBootComplete = () => {
+        window.__dashboardBootCompleted = true;
+        hideOverlay();
+      };
+
+      window.__dashboardReportBootError = (message, detail) => {
+        window.__dashboardBootCompleted = false;
+        report('error', message || 'Dashboard frontend failed to start.', detail || '');
+      };
+
+      window.addEventListener('error', (event) => {
+        const target = event.target;
+        if (target && target !== window && (target.tagName === 'SCRIPT' || target.tagName === 'LINK')) {
+          const resource = target.src || target.href || '(unknown resource)';
+          window.__dashboardReportBootError('Dashboard resource failed to load.', resource);
+          return;
+        }
+
+        const detail = event.error && event.error.stack
+          ? event.error.stack
+          : (event.message || '');
+        window.__dashboardReportBootError('Dashboard frontend crashed during startup.', detail);
+      }, true);
+
+      window.addEventListener('unhandledrejection', (event) => {
+        const reason = event.reason;
+        const detail = reason && reason.stack
+          ? reason.stack
+          : (typeof reason === 'string' ? reason : JSON.stringify(reason, null, 2));
+        window.__dashboardReportBootError('Dashboard hit an unhandled promise rejection.', detail || '');
+      });
+
+      window.setTimeout(() => {
+        if (window.__dashboardBootCompleted) return;
+        report(
+          'warn',
+          'Dashboard is taking longer than expected to start.',
+          'If this stays here, try a hard refresh. The page will also show JS or resource errors here instead of a blank screen.'
+        );
+      }, STARTUP_TIMEOUT_MS);
+    })();
+  </script>
+  <link rel="stylesheet" href="css/reset.css?v=20260408-bootfix">
+  <link rel="stylesheet" href="css/theme.css?v=20260408-bootfix">
+  <link rel="stylesheet" href="css/layout.css?v=20260408-bootfix">
+  <link rel="stylesheet" href="css/components.css?v=20260408-bootfix">
 </head>
 <body>
+  <div class="boot-overlay" id="boot-overlay">
+    <div class="boot-overlay-label">Dashboard Boot</div>
+    <div class="boot-overlay-message" id="boot-overlay-message">Loading dashboard shell...</div>
+    <pre class="boot-overlay-detail is-hidden" id="boot-overlay-detail"></pre>
+  </div>
   <div class="app">
     <header class="status-bar">
       <div class="status-left">
@@ -19,6 +253,7 @@
         <span class="status-item" id="status-info">Loading...</span>
       </div>
     </header>
+    <div class="backend-status-banner is-hidden" id="backend-status-banner"></div>
 
     <main class="panels">
       <aside id="sidebar" class="panel">
@@ -47,6 +282,14 @@
           </div>
           <div class="workspace-strip-cards" id="workspace-strip-cards">
             <div class="workspace-empty">No pinned sessions yet.</div>
+          </div>
+        </div>
+        <div class="composer-activity-shell is-hidden" id="composer-activity-shell">
+          <div class="composer-activity-header">
+            <span class="composer-activity-title" id="composer-activity-title">LIVE ACTIVITY</span>
+          </div>
+          <div class="composer-activity-log" id="composer-activity-log">
+            <div class="composer-activity-empty">No live activity yet.</div>
           </div>
         </div>
         <div id="chat-messages" class="chat-messages">
@@ -80,10 +323,10 @@
   </div>
 
   <!-- Components loaded first (they define functions used by app.js) -->
-  <script src="js/components/sidebar.js"></script>
-  <script src="js/components/session-list.js"></script>
-  <script src="js/components/chat-view.js"></script>
-  <script src="js/components/composer.js"></script>
-  <script src="js/app.js"></script>
+  <script src="js/components/sidebar.js?v=20260408-bootfix"></script>
+  <script src="js/components/session-list.js?v=20260408-bootfix"></script>
+  <script src="js/components/chat-view.js?v=20260408-bootfix"></script>
+  <script src="js/components/composer.js?v=20260408-bootfix"></script>
+  <script src="js/app.js?v=20260408-bootfix"></script>
 </body>
 </html>

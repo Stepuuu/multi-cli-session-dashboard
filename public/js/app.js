@@ -8,14 +8,20 @@ let messages = [];
 let offset = 0;
 const PAGE_SIZE = 50;
 const POLL_INTERVAL_MS = 4000;
+const BACKEND_HEALTH_INTERVAL_MS = 5000;
 const DASHBOARD_STATE_KEY = 'session-dashboard-state-v1';
 const DASHBOARD_DRAFTS_KEY = 'session-dashboard-drafts-v1';
 const DASHBOARD_PINNED_KEY = 'session-dashboard-pinned-v1';
+const DASHBOARD_SHOW_ARCHIVED_KEY = 'session-dashboard-show-archived-v1';
+const DASHBOARD_SEEN_SESSIONS_KEY = 'session-dashboard-seen-sessions-v1';
+const DASHBOARD_SEEN_PROJECTS_KEY = 'session-dashboard-seen-projects-v1';
 let projectList = [];
 let sessionList = [];
 let totalMessages = 0;
 let isLoading = false;
 let hasMoreOlder = false;
+let backendHealthy = true;
+let backendRecoveryRefreshInFlight = false;
 const transientMessagesBySession = new Map();
 let draftSessions = [];
 let dashboardCapabilities = null;
@@ -29,13 +35,25 @@ const sessionScrollModeBySession = new Map();
 const AUTO_FOLLOW_BOTTOM_THRESHOLD = 48;
 let projectsDigestSignature = '';
 const sessionDigestSignatureByProject = new Map();
+const sessionDigestCacheByProject = new Map();
+const sessionListCacheByProject = new Map();
+const draftMigrationInFlightByProject = new Map();
 let pinnedSessions = [];
+let showArchivedSessions = false;
+let seenSessionSignatures = {};
+let seenProjectLatest = {};
+const unreadSessionOverrides = new Set();
+let pendingSelectedTransientRenderHandle = 0;
+let pendingSelectedTransientRender = null;
 
 function buildProjectDigestSignature(projects) {
   return JSON.stringify((projects || []).map((project) => ([
     project.dirName || '',
     project.sessionCount || 0,
+    project.archivedSessionCount || 0,
+    project.totalSessionCount || 0,
     project.latestModified || project.latestModifiedMs || 0,
+    project.latestVisibleModified || 0,
     JSON.stringify(project.sourceCounts || {}),
   ])));
 }
@@ -45,12 +63,261 @@ function buildSessionDigestSignature(sessions) {
     session.sessionId || '',
     session.source || '',
     session.rawSessionId || '',
+    session.forkedFromId || '',
+    session.fileSizeBytes || 0,
+    session.lastUsedTokens || 0,
+    session.contextWindowTokens || 0,
     session.modified || '',
     session.messageCount || 0,
     session.model || '',
     session.customTitle || session.firstPrompt || '',
+    session.archived ? 1 : 0,
+    session.archivedAt || '',
   ])));
 }
+
+function dashboardSessionDisplayTitle(session) {
+  const title = session?.firstPrompt || session?.defaultFirstPrompt || 'Session';
+  return typeof title === 'string' && title.trim() ? title.trim() : 'Session';
+}
+
+function dashboardSessionOriginalTitle(session) {
+  const original = typeof session?.defaultFirstPrompt === 'string' ? session.defaultFirstPrompt.trim() : '';
+  const current = dashboardSessionDisplayTitle(session);
+  if (session?.customTitle && original && original !== current) {
+    return original;
+  }
+  return '';
+}
+
+function dashboardSessionTitleTooltip(session) {
+  const original = dashboardSessionOriginalTitle(session);
+  const forkInfo = dashboardSessionForkTooltip(session);
+  const parts = [];
+  if (original) {
+    parts.push(`Original: ${original}`);
+  } else {
+    parts.push(dashboardSessionDisplayTitle(session));
+  }
+  if (forkInfo) {
+    parts.push(forkInfo);
+  }
+  return parts.join(' | ');
+}
+
+function dashboardSessionLookupProjectDir(session) {
+  if (session?.projectDir) return session.projectDir;
+  return selectedProject || '';
+}
+
+function dashboardFindSessionByRawId(projectDir, rawSessionId) {
+  if (!projectDir || !rawSessionId) return null;
+
+  const cached = sessionListCacheByProject.get(projectDir);
+  if (Array.isArray(cached)) {
+    const cachedMatch = cached.find((session) => session?.rawSessionId === rawSessionId);
+    if (cachedMatch) return cachedMatch;
+  }
+
+  if (projectDir === selectedProject) {
+    const liveMatch = allSessionsForProject(projectDir).find((session) => session?.rawSessionId === rawSessionId);
+    if (liveMatch) return liveMatch;
+  }
+
+  return pinnedSessions.find((session) => session?.projectDir === projectDir && session?.rawSessionId === rawSessionId) || null;
+}
+
+function dashboardSessionForkTooltip(session) {
+  const forkedFromId = typeof session?.forkedFromId === 'string' ? session.forkedFromId.trim() : '';
+  if (!forkedFromId) return '';
+  const projectDir = dashboardSessionLookupProjectDir(session);
+  const parent = dashboardFindSessionByRawId(projectDir, forkedFromId);
+  const parentTitle = parent ? dashboardSessionDisplayTitle(parent) : '';
+  if (parentTitle) {
+    return `Forked from ${forkedFromId} (${parentTitle})`;
+  }
+  return `Forked from ${forkedFromId}`;
+}
+
+function dashboardSessionCacheInfo(session) {
+  const inputTokens = Number(session?.lastInputTokens ?? 0);
+  const cachedInputTokens = Number(session?.lastCachedInputTokens ?? 0);
+  const outputTokens = Number(session?.lastOutputTokens ?? 0);
+  if (!Number.isFinite(inputTokens) || inputTokens <= 0 || !Number.isFinite(cachedInputTokens)) {
+    return null;
+  }
+  return {
+    inputTokens,
+    cachedInputTokens,
+    outputTokens: Number.isFinite(outputTokens) ? outputTokens : 0,
+    percent: Math.round((cachedInputTokens / inputTokens) * 100),
+  };
+}
+
+function dashboardSessionCacheTooltip(session) {
+  const info = dashboardSessionCacheInfo(session);
+  if (!info) return '';
+  const outputPart = info.outputTokens ? ` Output: ${info.outputTokens}.` : '';
+  return `Latest cache hit: ${info.cachedInputTokens}/${info.inputTokens} input tokens (${info.percent}%).${outputPart}`;
+}
+
+function formatTokenCompact(value) {
+  const numeric = Number(value ?? 0);
+  if (!Number.isFinite(numeric) || numeric <= 0) return '0';
+  return numeric.toLocaleString();
+}
+
+function formatFileSizeCompact(bytes) {
+  const numeric = Number(bytes ?? 0);
+  if (!Number.isFinite(numeric) || numeric <= 0) return '';
+  const units = ['B', 'KB', 'MB', 'GB', 'TB'];
+  let value = numeric;
+  let unitIndex = 0;
+  while (value >= 1024 && unitIndex < units.length - 1) {
+    value /= 1024;
+    unitIndex += 1;
+  }
+  const digits = value >= 100 || unitIndex === 0 ? 0 : 1;
+  return `${value.toFixed(digits)}${units[unitIndex]}`;
+}
+
+function dashboardSessionFileSizeLabel(session) {
+  return formatFileSizeCompact(session?.fileSizeBytes ?? 0);
+}
+
+function dashboardSessionFileSizeTooltip(session) {
+  const numeric = Number(session?.fileSizeBytes ?? 0);
+  if (!Number.isFinite(numeric) || numeric <= 0) return '';
+  return `Transcript file size: ${numeric.toLocaleString()} bytes (${formatFileSizeCompact(numeric)})`;
+}
+
+function dashboardSessionContextInfo(session) {
+  const contextWindow = Number(session?.contextWindowTokens ?? 0);
+  const usedTokens = Number(session?.lastUsedTokens ?? 0);
+  const totalInputTokens = Number(session?.totalInputTokens ?? 0);
+  const totalOutputTokens = Number(session?.totalOutputTokens ?? 0);
+  const cachedInputTokens = Number(session?.lastCachedInputTokens ?? 0);
+
+  if (!Number.isFinite(contextWindow) || contextWindow <= 0 || !Number.isFinite(usedTokens) || usedTokens <= 0) {
+    return null;
+  }
+
+  const safeUsedTokens = Math.max(0, usedTokens);
+  const remainingTokens = Math.max(0, contextWindow - safeUsedTokens);
+  return {
+    contextWindow,
+    usedTokens: safeUsedTokens,
+    remainingTokens,
+    totalInputTokens: Number.isFinite(totalInputTokens) ? totalInputTokens : 0,
+    totalOutputTokens: Number.isFinite(totalOutputTokens) ? totalOutputTokens : 0,
+    cachedInputTokens: Number.isFinite(cachedInputTokens) ? cachedInputTokens : 0,
+    percent: Math.max(0, Math.min(100, Math.round((safeUsedTokens / contextWindow) * 100))),
+  };
+}
+
+function dashboardSessionContextTooltip(session) {
+  const info = dashboardSessionContextInfo(session);
+  if (!info) return '';
+  const parts = [
+    `Context used: ${formatTokenCompact(info.usedTokens)}/${formatTokenCompact(info.contextWindow)} (${info.percent}%)`,
+    `Remaining: ${formatTokenCompact(info.remainingTokens)}`,
+  ];
+  if (info.totalInputTokens > 0) parts.push(`Total input: ${formatTokenCompact(info.totalInputTokens)}`);
+  if (info.totalOutputTokens > 0) parts.push(`Total output: ${formatTokenCompact(info.totalOutputTokens)}`);
+  if (info.cachedInputTokens > 0) parts.push(`Latest cached input: ${formatTokenCompact(info.cachedInputTokens)}`);
+  return parts.join(' | ');
+}
+
+function isLikelyBackendUnavailableError(err) {
+  if (!err) return false;
+  const message = typeof err?.message === 'string' ? err.message : String(err);
+  return (
+    err.name === 'TypeError' ||
+    /failed to fetch/i.test(message) ||
+    /network ?error/i.test(message) ||
+    /load failed/i.test(message)
+  );
+}
+
+function backendUnavailableMessage() {
+  return 'Dashboard backend unavailable or restarting. Auto-retrying...';
+}
+
+function setBootstrapMessage(message) {
+  if (typeof window.__dashboardSetBootstrapMessage === 'function') {
+    window.__dashboardSetBootstrapMessage(message);
+  }
+}
+
+function markBootstrapComplete() {
+  if (typeof window.__dashboardMarkBootComplete === 'function') {
+    window.__dashboardMarkBootComplete();
+  }
+}
+
+function reportBootstrapError(err, context = 'Dashboard failed to initialize.') {
+  const detail = err && typeof err === 'object' && typeof err.stack === 'string'
+    ? err.stack
+    : (typeof err?.message === 'string' ? err.message : String(err || 'Unknown error'));
+  console.error(context, err);
+  if (typeof window.__dashboardReportBootError === 'function') {
+    window.__dashboardReportBootError(context, detail);
+  }
+  updateStatus('Initialization failed');
+}
+
+function currentDashboardOrigin() {
+  if (typeof window === 'undefined' || !window.location) return '';
+  return window.location.origin || '';
+}
+
+function buildLoopbackFallbackUrl(url) {
+  if (typeof window === 'undefined' || !window.location) return '';
+
+  try {
+    const current = new URL(currentDashboardOrigin());
+    const target = new URL(url, current);
+    if (target.origin !== current.origin) return '';
+
+    let fallbackHost = '';
+    if (current.hostname === 'localhost') {
+      fallbackHost = '127.0.0.1';
+    } else if (current.hostname === '127.0.0.1') {
+      fallbackHost = 'localhost';
+    }
+    if (!fallbackHost) return '';
+
+    const fallback = new URL(target.toString());
+    fallback.hostname = fallbackHost;
+    return fallback.toString();
+  } catch {
+    return '';
+  }
+}
+
+async function dashboardFetch(url, options = {}) {
+  try {
+    return await fetch(url, options);
+  } catch (err) {
+    if (!isLikelyBackendUnavailableError(err)) {
+      throw err;
+    }
+
+    const fallbackUrl = buildLoopbackFallbackUrl(url);
+    if (!fallbackUrl) {
+      throw err;
+    }
+
+    return fetch(fallbackUrl, {
+      ...options,
+      mode: 'cors',
+    });
+  }
+}
+
+window.__dashboardIsBackendUnavailableError = isLikelyBackendUnavailableError;
+window.__dashboardBackendUnavailableMessage = backendUnavailableMessage;
+window.__dashboardFetch = dashboardFetch;
 
 function safeReadStorage(key, fallback) {
   try {
@@ -88,6 +355,32 @@ function loadPersistedPinnedSessions() {
   return Array.isArray(stored) ? stored : [];
 }
 
+function persistShowArchivedSessions() {
+  safeWriteStorage(DASHBOARD_SHOW_ARCHIVED_KEY, showArchivedSessions);
+}
+
+function loadPersistedShowArchivedSessions() {
+  return !!safeReadStorage(DASHBOARD_SHOW_ARCHIVED_KEY, false);
+}
+
+function persistSeenSessionSignatures() {
+  safeWriteStorage(DASHBOARD_SEEN_SESSIONS_KEY, seenSessionSignatures);
+}
+
+function loadPersistedSeenSessionSignatures() {
+  const stored = safeReadStorage(DASHBOARD_SEEN_SESSIONS_KEY, {});
+  return stored && typeof stored === 'object' ? stored : {};
+}
+
+function persistSeenProjectLatest() {
+  safeWriteStorage(DASHBOARD_SEEN_PROJECTS_KEY, seenProjectLatest);
+}
+
+function loadPersistedSeenProjectLatest() {
+  const stored = safeReadStorage(DASHBOARD_SEEN_PROJECTS_KEY, {});
+  return stored && typeof stored === 'object' ? stored : {};
+}
+
 function persistDashboardState() {
   safeWriteStorage(DASHBOARD_STATE_KEY, {
     project: selectedProject,
@@ -106,10 +399,19 @@ function currentDraftSessions(projectDir = selectedProject) {
   return draftSessions.filter((session) => session.projectDir === projectDir);
 }
 
+function allSessionsForProject(projectDir = selectedProject) {
+  return [...currentDraftSessions(projectDir), ...sessionList];
+}
+
+function isSessionVisibleInList(session) {
+  if (!session) return false;
+  if (session.isDraft) return true;
+  return showArchivedSessions || !session.archived;
+}
+
 function defaultSessionForProject(projectDir = selectedProject) {
-  if (sessionList.length > 0) return sessionList[0];
-  const drafts = currentDraftSessions(projectDir);
-  return drafts[0] || null;
+  const visible = displayedSessionList(projectDir);
+  return visible[0] || null;
 }
 
 function getDashboardSelection() {
@@ -130,8 +432,12 @@ function currentMessageList() {
   return [...messages, ...(transientMessagesBySession.get(selectedSession) || [])];
 }
 
-function displayedSessionList() {
-  return [...currentDraftSessions(), ...sessionList];
+function displayedSessionList(projectDir = selectedProject) {
+  return allSessionsForProject(projectDir).filter((session) => isSessionVisibleInList(session));
+}
+
+function archivedSessionCountForProject(projectDir = selectedProject) {
+  return allSessionsForProject(projectDir).filter((session) => !session.isDraft && session.archived).length;
 }
 
 function pinnedSessionIdSet() {
@@ -140,20 +446,98 @@ function pinnedSessionIdSet() {
 
 window.__dashboardIsPinnedSession = (sessionId) => pinnedSessionIdSet().has(sessionId);
 
+function sessionUnreadSignature(session) {
+  if (!session) return '';
+  return String(session.messageCount || 0);
+}
+
+function updateSessionDigestCache(projectDir, sessionsOrDigest) {
+  if (!projectDir) return;
+  sessionDigestSignatureByProject.set(projectDir, buildSessionDigestSignature(sessionsOrDigest || []));
+  const normalized = Array.isArray(sessionsOrDigest) ? sessionsOrDigest.slice() : [];
+  sessionDigestCacheByProject.set(projectDir, normalized);
+  sessionListCacheByProject.set(projectDir, normalized);
+}
+
+function markProjectSeen(projectDir = selectedProject) {
+  if (!projectDir) return;
+  const project = projectList.find((item) => item.dirName === projectDir);
+  if (!project) return;
+  seenProjectLatest[projectDir] = project.latestModified || project.latestModifiedMs || 0;
+  persistSeenProjectLatest();
+}
+
+function markSessionSeen(sessionId, session = null, projectDir = selectedProject) {
+  if (!sessionId) return;
+  const meta = session || findSessionMetaById(sessionId) || pinnedSessions.find((item) => item.sessionId === sessionId);
+  if (!meta) return;
+  seenSessionSignatures[sessionId] = sessionUnreadSignature(meta);
+  unreadSessionOverrides.delete(sessionId);
+  persistSeenSessionSignatures();
+  if (projectDir) {
+    markProjectSeen(projectDir);
+  }
+  renderDisplayedSessionList();
+  renderProjectSidebar();
+  renderWorkspaceStrip();
+}
+
+function isSessionUnread(session) {
+  if (!session?.sessionId || session.sessionId === selectedSession) return false;
+  if (unreadSessionOverrides.has(session.sessionId)) return true;
+  const seen = seenSessionSignatures[session.sessionId];
+  if (!seen) return false;
+  return seen !== sessionUnreadSignature(session);
+}
+
+function projectUnreadMap() {
+  const result = new Map();
+
+  for (const project of projectList) {
+    const digest = sessionDigestCacheByProject.get(project.dirName) || [];
+    const visibleDigest = digest.filter((session) => !session.archived);
+    if (visibleDigest.length) {
+      const unreadCount = visibleDigest.filter((session) => isSessionUnread(session)).length;
+      if (unreadCount > 0) {
+        result.set(project.dirName, unreadCount);
+        continue;
+      }
+    }
+
+    const latestModified = project.latestVisibleModified || project.latestModified || project.latestModifiedMs || 0;
+    const seenLatest = seenProjectLatest[project.dirName] || 0;
+    if (seenLatest && latestModified > seenLatest) {
+      result.set(project.dirName, 1);
+    }
+  }
+
+  return result;
+}
+
 function activeProjectIds() {
   return new Set(activeProjectBySession.values());
 }
 
 function renderProjectSidebar() {
-  renderProjectList(projectList, selectedProject, activeProjectIds());
+  renderProjectList(projectList, selectedProject, activeProjectIds(), projectUnreadMap());
 }
 
 function renderDisplayedSessionList() {
-  renderSessionList(displayedSessionList(), selectedSession, activeInteractionSessions, pinnedSessionIdSet());
+  const unreadIds = new Set(displayedSessionList().filter((session) => isSessionUnread(session)).map((session) => session.sessionId));
+  renderSessionList(
+    displayedSessionList(),
+    selectedSession,
+    activeInteractionSessions,
+    pinnedSessionIdSet(),
+    unreadIds,
+    {
+      hiddenArchivedCount: showArchivedSessions ? 0 : archivedSessionCountForProject(),
+    },
+  );
 }
 
 function findSessionMetaById(id) {
-  return displayedSessionList().find((session) => session.sessionId === id) || null;
+  return allSessionsForProject().find((session) => session.sessionId === id) || null;
 }
 
 function updatePinnedSessionSnapshot(meta, projectDir = selectedProject) {
@@ -175,6 +559,17 @@ function updatePinnedSessionSnapshot(meta, projectDir = selectedProject) {
       modified: meta.modified || session.modified || '',
       messageCount: meta.messageCount || 0,
       rawSessionId: meta.rawSessionId || session.rawSessionId || '',
+      forkedFromId: meta.forkedFromId || '',
+      fileSizeBytes: meta.fileSizeBytes || session.fileSizeBytes || 0,
+      lastInputTokens: meta.lastInputTokens || 0,
+      lastCachedInputTokens: meta.lastCachedInputTokens || 0,
+      lastOutputTokens: meta.lastOutputTokens || 0,
+      lastUsedTokens: meta.lastUsedTokens || 0,
+      totalInputTokens: meta.totalInputTokens || 0,
+      totalOutputTokens: meta.totalOutputTokens || 0,
+      contextWindowTokens: meta.contextWindowTokens || 0,
+      archived: !!meta.archived,
+      archivedAt: meta.archivedAt || '',
       isDraft: !!meta.isDraft,
     };
   });
@@ -205,6 +600,17 @@ function pinSession(meta, projectDir = selectedProject) {
     modified: meta.modified || '',
     messageCount: meta.messageCount || 0,
     rawSessionId: meta.rawSessionId || '',
+    forkedFromId: meta.forkedFromId || '',
+    fileSizeBytes: meta.fileSizeBytes || 0,
+    lastInputTokens: meta.lastInputTokens || 0,
+    lastCachedInputTokens: meta.lastCachedInputTokens || 0,
+    lastOutputTokens: meta.lastOutputTokens || 0,
+    lastUsedTokens: meta.lastUsedTokens || 0,
+    totalInputTokens: meta.totalInputTokens || 0,
+    totalOutputTokens: meta.totalOutputTokens || 0,
+    contextWindowTokens: meta.contextWindowTokens || 0,
+    archived: !!meta.archived,
+    archivedAt: meta.archivedAt || '',
     isDraft: !!meta.isDraft,
   });
   pinnedSessions = pinnedSessions.slice(0, 8);
@@ -238,24 +644,45 @@ function renderWorkspaceStrip() {
   }
 
   const activeCount = pinnedSessions.filter((session) => activeInteractionSessions.has(session.sessionId)).length;
-  metaEl.textContent = `${pinnedSessions.length} pinned${activeCount ? ` · ${activeCount} live` : ''}`;
+  const unreadCount = pinnedSessions.filter((session) => isSessionUnread(session)).length;
+  metaEl.textContent = `${pinnedSessions.length} pinned${activeCount ? ` · ${activeCount} live` : ''}${unreadCount ? ` · ${unreadCount} unread` : ''}`;
 
   cardsEl.innerHTML = pinnedSessions.map((session) => {
     const active = session.sessionId === selectedSession;
     const busy = activeInteractionSessions.has(session.sessionId);
+    const archived = !!session.archived;
     const sourceClass = escapeHtml(session.source || 'unknown');
+    const unread = isSessionUnread(session);
     const sourceLabel = escapeHtml(session.sourceShortLabel || session.sourceLabel || session.source || '?');
-    const rawTitle = session.customTitle || session.firstPrompt || session.defaultFirstPrompt || '(no prompt)';
+    const rawTitle = dashboardSessionDisplayTitle(session);
+    const titleTooltip = escapeHtml(dashboardSessionTitleTooltip(session));
     const title = escapeHtml(truncate(rawTitle, 34));
     const projectName = escapeHtml(session.projectName || 'project');
     const date = escapeHtml(formatRelativeDate(session.modified || ''));
-    const tooltip = escapeHtml(`${rawTitle}\n${projectName} · ${date} · ${session.messageCount || 0} msgs`);
+    const tooltipParts = [
+      rawTitle,
+      projectName ? `${projectName} · ${date} · ${session.messageCount || 0} msgs` : `${date} · ${session.messageCount || 0} msgs`,
+    ];
+    const originalTitle = dashboardSessionOriginalTitle(session);
+    if (originalTitle) {
+      tooltipParts.push(`Original: ${originalTitle}`);
+    }
+    if (archived) {
+      tooltipParts.push('Archived in VS Code Codex');
+    }
+    const cacheTooltip = dashboardSessionCacheTooltip(session);
+    if (cacheTooltip) {
+      tooltipParts.push(cacheTooltip);
+    }
+    const tooltip = escapeHtml(tooltipParts.join('\n'));
     return `
-      <button class="workspace-card${active ? ' active' : ''}${busy ? ' is-busy' : ''}" data-workspace-session="${escapeHtml(session.sessionId)}" title="${tooltip}">
+      <button class="workspace-card${active ? ' active' : ''}${busy ? ' is-busy' : ''}${unread ? ' is-unread' : ''}${archived ? ' is-archived' : ''}" data-workspace-session="${escapeHtml(session.sessionId)}" title="${tooltip}">
         <span class="workspace-card-top">
           <span class="session-source-badge source-${sourceClass}">${sourceLabel}</span>
+          ${archived ? '<span class="session-archived-badge">ARCH</span>' : ''}
           ${busy ? '<span class="workspace-live-dot"></span>' : ''}
-          <span class="workspace-card-title">${title}</span>
+          ${unread ? '<span class="workspace-unread-dot"></span>' : ''}
+          <span class="workspace-card-title" title="${titleTooltip}">${title}</span>
           <span class="workspace-card-remove" data-workspace-remove="${escapeHtml(session.sessionId)}" title="Remove from workspace">×</span>
         </span>
       </button>
@@ -273,11 +700,36 @@ function renderWorkspaceStrip() {
         selectSessionById(sessionId);
         return;
       }
-      await loadSessions(pinned.projectDir, {
-        sessionId: pinned.sessionId,
-        source: pinned.source,
-        rawSessionId: pinned.rawSessionId,
-      });
+      const cachedSessions = sessionDigestCacheByProject.get(pinned.projectDir);
+      if (cachedSessions && cachedSessions.length) {
+        cacheSessionState();
+        selectedProject = pinned.projectDir;
+        selectedSession = null;
+        sessionMeta = null;
+        messages = [];
+        offset = 0;
+        hasMoreOlder = false;
+        persistDashboardState();
+
+        sessionList = cachedSessions.slice();
+        renderProjectSidebar();
+        renderChatHeader(null);
+        document.getElementById('chat-messages').innerHTML = '<div class="loading">Loading session...</div>';
+        notifySessionSelection();
+        renderSessionActions();
+        renderDisplayedSessionList();
+        renderWorkspaceStrip();
+        updateStatusBar();
+
+        selectSessionById(pinned.sessionId);
+        refreshCurrentProjectSessionsSilently();
+      } else {
+        await loadSessions(pinned.projectDir, {
+          sessionId: pinned.sessionId,
+          source: pinned.source,
+          rawSessionId: pinned.rawSessionId,
+        });
+      }
       if (selectedSession !== pinned.sessionId) {
         removePinnedSession(pinned.sessionId);
         renderDisplayedSessionList();
@@ -304,9 +756,19 @@ function currentSessionHasActiveDashboardInteraction() {
   return !!(selectedSession && activeInteractionSessions.has(selectedSession));
 }
 
-function renderCurrentChat() {
+function renderCurrentChat(options = {}) {
+  const container = chatContainer();
+  const preserveScroll = options.preserveScroll !== false && !!(container && selectedSession && !shouldAutoFollowSession(selectedSession));
+  const previousScrollTop = preserveScroll ? container.scrollTop : 0;
+
   renderMessages(currentMessageList(), false);
   renderLoadMoreButton(hasMoreOlder);
+
+  if (preserveScroll && container) {
+    requestAnimationFrame(() => {
+      container.scrollTop = previousScrollTop;
+    });
+  }
 }
 
 function chatContainer() {
@@ -370,6 +832,54 @@ function scrollChatToBottom() {
   });
 }
 
+function cancelSelectedTransientRender() {
+  if (pendingSelectedTransientRenderHandle) {
+    cancelAnimationFrame(pendingSelectedTransientRenderHandle);
+    pendingSelectedTransientRenderHandle = 0;
+  }
+  pendingSelectedTransientRender = null;
+}
+
+function scheduleSelectedTransientRender(sessionId, followAfterRender) {
+  if (!sessionId || sessionId !== selectedSession) return;
+
+  if (pendingSelectedTransientRender?.sessionId === sessionId) {
+    pendingSelectedTransientRender.followAfterRender = (
+      pendingSelectedTransientRender.followAfterRender || !!followAfterRender
+    );
+    return;
+  }
+
+  pendingSelectedTransientRender = {
+    sessionId,
+    followAfterRender: !!followAfterRender,
+  };
+
+  pendingSelectedTransientRenderHandle = requestAnimationFrame(() => {
+    const pending = pendingSelectedTransientRender;
+    pendingSelectedTransientRenderHandle = 0;
+    pendingSelectedTransientRender = null;
+    if (!pending || pending.sessionId !== selectedSession) return;
+    renderCurrentChat();
+    if (pending.followAfterRender) {
+      scrollChatToBottom();
+    }
+  });
+}
+
+function dropTransientMessagesForSession(sessionId, options = {}) {
+  if (!sessionId) return false;
+  const hadTransient = transientMessagesBySession.has(sessionId);
+  transientMessagesBySession.delete(sessionId);
+  if (options.clearUnread) {
+    unreadSessionOverrides.delete(sessionId);
+  }
+  if (sessionId === selectedSession) {
+    cancelSelectedTransientRender();
+  }
+  return hadTransient;
+}
+
 function setTransientMessagesForSession(sessionId, nextMessages) {
   if (!sessionId) return;
   const followBeforeRender = sessionId === selectedSession
@@ -379,16 +889,19 @@ function setTransientMessagesForSession(sessionId, nextMessages) {
   const normalized = Array.isArray(nextMessages) ? nextMessages.slice() : [];
   if (normalized.length > 0) {
     transientMessagesBySession.set(sessionId, normalized);
+    if (sessionId !== selectedSession) {
+      unreadSessionOverrides.add(sessionId);
+      renderDisplayedSessionList();
+      renderProjectSidebar();
+      renderWorkspaceStrip();
+    }
   } else {
     transientMessagesBySession.delete(sessionId);
   }
   if (sessionId !== selectedSession) {
     return;
   }
-  renderCurrentChat();
-  if (followBeforeRender) {
-    scrollChatToBottom();
-  }
+  scheduleSelectedTransientRender(sessionId, followBeforeRender);
 }
 
 function clearTransientMessagesForSession(sessionId) {
@@ -397,14 +910,14 @@ function clearTransientMessagesForSession(sessionId) {
     ? (shouldAutoFollowSession(sessionId) || isChatNearBottom())
     : shouldAutoFollowSession(sessionId);
   setSessionAutoFollow(sessionId, followBeforeRender);
-  transientMessagesBySession.delete(sessionId);
+  dropTransientMessagesForSession(sessionId, { clearUnread: sessionId === selectedSession });
+  renderDisplayedSessionList();
+  renderProjectSidebar();
+  renderWorkspaceStrip();
   if (sessionId !== selectedSession) {
     return;
   }
-  renderCurrentChat();
-  if (followBeforeRender) {
-    scrollChatToBottom();
-  }
+  scheduleSelectedTransientRender(sessionId, followBeforeRender);
 }
 
 window.__dashboardSetTransientMessagesForSession = setTransientMessagesForSession;
@@ -424,15 +937,23 @@ window.__dashboardSetSessionActivityState = (sessionId, active, projectToken = '
   renderProjectSidebar();
 };
 
-async function reloadCurrentSession() {
+async function reloadCurrentSession(options = {}) {
   if (!selectedProject || !selectedSession) return;
+  const preserveVisibleMessages = !!options.preserveVisibleMessages;
   offset = 0;
-  messages = [];
-  transientMessagesBySession.delete(selectedSession);
+  if (!preserveVisibleMessages) {
+    messages = [];
+    dropTransientMessagesForSession(selectedSession, { clearUnread: true });
+  } else {
+    cancelSelectedTransientRender();
+  }
   sessionsNeedingHydration.delete(selectedSession);
   sessionStateCacheBySession.delete(selectedSession);
   setSessionAutoFollow(selectedSession, true);
-  await loadMessages(selectedProject, selectedSession, false);
+  await loadMessages(selectedProject, selectedSession, false, {
+    preserveVisibleMessages,
+    clearTransientOnSuccess: preserveVisibleMessages,
+  });
 }
 
 async function reloadSessionsAndSelect(projectDir, matcher) {
@@ -441,6 +962,7 @@ async function reloadSessionsAndSelect(projectDir, matcher) {
 
 async function refreshCurrentProjectSessionsSilently() {
   if (!selectedProject) return;
+  const priorDrafts = currentDraftSessions(selectedProject).slice();
   const digest = await fetchJSON(`/api/sessions-digest/${encodeURIComponent(selectedProject)}`);
   if (!digest) return false;
 
@@ -455,14 +977,17 @@ async function refreshCurrentProjectSessionsSilently() {
 
   const previousSelected = selectedSession;
   sessionList = data;
-  sessionDigestSignatureByProject.set(selectedProject, buildSessionDigestSignature(sessionList));
+  updateSessionDigestCache(selectedProject, sessionList);
   reconcileDraftSessionsForProject(selectedProject, sessionList);
+  renderSessionActions();
   renderDisplayedSessionList();
+  scheduleDraftMigration(selectedProject, sessionList, priorDrafts);
 
   if (previousSelected) {
     const nextMeta = findSessionMetaById(previousSelected);
     if (nextMeta) {
       sessionMeta = nextMeta;
+      markSessionSeen(previousSelected, nextMeta, selectedProject);
       updatePinnedSessionSnapshot(nextMeta, selectedProject);
       renderChatHeader(sessionMeta);
       renderWorkspaceStrip();
@@ -471,6 +996,47 @@ async function refreshCurrentProjectSessionsSilently() {
   }
 
   return true;
+}
+
+async function refreshProjectSessionsSilently(projectDir) {
+  if (!projectDir) return false;
+  const digest = await fetchJSON(`/api/sessions-digest/${encodeURIComponent(projectDir)}`);
+  if (!digest) return false;
+
+  const nextDigestSignature = buildSessionDigestSignature(digest);
+  const previousDigestSignature = sessionDigestSignatureByProject.get(projectDir) || '';
+  if (nextDigestSignature === previousDigestSignature) {
+    return false;
+  }
+
+  const data = await fetchJSON(`/api/sessions/${encodeURIComponent(projectDir)}`);
+  if (!data) return false;
+
+  updateSessionDigestCache(projectDir, data);
+  if (projectDir === selectedProject) {
+    return refreshCurrentProjectSessionsSilently();
+  }
+
+  for (const session of data) {
+    updatePinnedSessionSnapshot(session, projectDir);
+  }
+  renderDisplayedSessionList();
+  renderProjectSidebar();
+  renderWorkspaceStrip();
+  updateStatusBar();
+  return true;
+}
+
+function watchedProjectIds() {
+  const ids = new Set();
+  if (selectedProject) ids.add(selectedProject);
+  pinnedSessions.forEach((session) => {
+    if (session.projectDir) ids.add(session.projectDir);
+  });
+  activeProjectBySession.forEach((projectDir) => {
+    if (projectDir) ids.add(projectDir);
+  });
+  return [...ids];
 }
 
 function matchSessionByMatcher(items, matcher) {
@@ -509,6 +1075,108 @@ function reconcileDraftSessionsForProject(projectDir, sessions) {
   }
 }
 
+async function migrateDraftStateToSessions(projectDir, sessions, priorDrafts = []) {
+  if (!projectDir || !Array.isArray(sessions) || !sessions.length || !Array.isArray(priorDrafts) || !priorDrafts.length) {
+    return false;
+  }
+
+  let pinnedChanged = false;
+  let sessionChanged = false;
+
+  for (const draft of priorDrafts) {
+    if (!draft?.rawSessionId) continue;
+
+    const realSession = sessions.find((session) => (
+      session.source === draft.source &&
+      session.rawSessionId === draft.rawSessionId
+    ));
+    if (!realSession) continue;
+
+    const pinnedDraft = pinnedSessions.find((session) => session.sessionId === draft.sessionId);
+    if (pinnedDraft) {
+      pinnedSessions = pinnedSessions.filter((session) => session.sessionId !== draft.sessionId);
+      pinnedSessions = pinnedSessions.filter((session) => session.sessionId !== realSession.sessionId);
+      pinnedSessions.unshift({
+        ...pinnedDraft,
+        sessionId: realSession.sessionId,
+        projectDir,
+        projectName: realSession.projectName || pinnedDraft.projectName || '',
+        source: realSession.source || pinnedDraft.source || '',
+        sourceLabel: realSession.sourceLabel || pinnedDraft.sourceLabel || '',
+        sourceShortLabel: realSession.sourceShortLabel || pinnedDraft.sourceShortLabel || '',
+        firstPrompt: realSession.firstPrompt || draft.firstPrompt || pinnedDraft.firstPrompt || '(no prompt)',
+        customTitle: draft.customTitle || realSession.customTitle || pinnedDraft.customTitle || '',
+        defaultFirstPrompt: realSession.defaultFirstPrompt || draft.defaultFirstPrompt || pinnedDraft.defaultFirstPrompt || realSession.firstPrompt || '(no prompt)',
+        summary: realSession.summary || pinnedDraft.summary || '',
+        modified: realSession.modified || pinnedDraft.modified || '',
+        messageCount: realSession.messageCount || 0,
+        rawSessionId: realSession.rawSessionId || pinnedDraft.rawSessionId || '',
+        lastInputTokens: realSession.lastInputTokens || 0,
+        lastCachedInputTokens: realSession.lastCachedInputTokens || 0,
+        lastOutputTokens: realSession.lastOutputTokens || 0,
+        archived: !!realSession.archived,
+        archivedAt: realSession.archivedAt || '',
+        isDraft: false,
+      });
+      pinnedSessions = pinnedSessions.slice(0, 8);
+      pinnedChanged = true;
+    }
+
+    if (draft.customTitle && draft.customTitle !== (realSession.customTitle || '')) {
+      const result = await renameSessionRequest(projectDir, realSession.sessionId, draft.customTitle);
+      if (result) {
+        realSession.customTitle = draft.customTitle;
+        realSession.defaultFirstPrompt = realSession.defaultFirstPrompt || draft.defaultFirstPrompt || realSession.firstPrompt || '(no prompt)';
+        realSession.firstPrompt = draft.customTitle;
+        sessionChanged = true;
+      }
+    }
+  }
+
+  if (pinnedChanged) {
+    persistPinnedSessions();
+  }
+
+  return pinnedChanged || sessionChanged;
+}
+
+function scheduleDraftMigration(projectDir, sessions, priorDrafts = []) {
+  if (!projectDir || !Array.isArray(priorDrafts) || !priorDrafts.length) return;
+  if (draftMigrationInFlightByProject.has(projectDir)) return;
+
+  const task = (async () => {
+    try {
+      const changed = await migrateDraftStateToSessions(projectDir, sessions, priorDrafts);
+      if (!changed) return;
+
+      updateSessionDigestCache(projectDir, sessions);
+      renderWorkspaceStrip();
+
+      if (selectedProject !== projectDir) {
+        return;
+      }
+
+      renderSessionActions();
+      renderDisplayedSessionList();
+      renderProjectSidebar();
+      updateStatusBar();
+
+      if (!selectedSession) return;
+      const nextMeta = findSessionMetaById(selectedSession);
+      if (!nextMeta) return;
+      sessionMeta = nextMeta;
+      renderChatHeader(sessionMeta);
+      persistDashboardState();
+    } catch (err) {
+      console.error('Draft migration failed', err);
+    } finally {
+      draftMigrationInFlightByProject.delete(projectDir);
+    }
+  })();
+
+  draftMigrationInFlightByProject.set(projectDir, task);
+}
+
 function upsertDraftSession(draft) {
   draftSessions = draftSessions.filter((session) => (
     !(session.projectDir === draft.projectDir && session.source === draft.source)
@@ -536,6 +1204,7 @@ function rememberCreatedSessionForDraft(draftSessionId, createdSession) {
     persistDraftSessions();
     if (selectedSession === draftSessionId) {
       sessionMeta = findSessionMetaById(draftSessionId) || sessionMeta;
+      markSessionSeen(draftSessionId, sessionMeta, selectedProject);
       persistDashboardState();
     }
     renderWorkspaceStrip();
@@ -562,6 +1231,14 @@ async function restoreInitialDashboardView() {
 }
 
 window.__dashboardGetSelection = getDashboardSelection;
+window.__dashboardBuildSessionTitleTooltip = dashboardSessionTitleTooltip;
+window.__dashboardBuildSessionForkTooltip = dashboardSessionForkTooltip;
+window.__dashboardSessionCacheInfo = dashboardSessionCacheInfo;
+window.__dashboardBuildSessionCacheTooltip = dashboardSessionCacheTooltip;
+window.__dashboardSessionFileSizeLabel = dashboardSessionFileSizeLabel;
+window.__dashboardSessionFileSizeTooltip = dashboardSessionFileSizeTooltip;
+window.__dashboardSessionContextInfo = dashboardSessionContextInfo;
+window.__dashboardBuildSessionContextTooltip = dashboardSessionContextTooltip;
 window.reloadCurrentSession = reloadCurrentSession;
 window.__dashboardReloadSessionsAndSelect = reloadSessionsAndSelect;
 window.__dashboardRememberCreatedSessionForDraft = rememberCreatedSessionForDraft;
@@ -570,10 +1247,21 @@ window.__dashboardMarkSessionNeedsHydration = (sessionId) => {
 };
 window.__dashboardPrepareSessionForNewInteraction = async (sessionId) => {
   if (!sessionId || sessionId !== selectedSession) return;
+  if (sessionMeta?.isDraft && sessionMeta?.rawSessionId && selectedProject) {
+    await refreshCurrentProjectSessionsSilently();
+    const bridged = sessionList.find((session) => (
+      session.source === sessionMeta.source &&
+      session.rawSessionId === sessionMeta.rawSessionId
+    ));
+    if (bridged) {
+      selectSessionById(bridged.sessionId);
+      return;
+    }
+  }
   const hasTransient = (transientMessagesBySession.get(sessionId) || []).length > 0;
   const isActive = activeInteractionSessions.has(sessionId);
   if (sessionsNeedingHydration.has(sessionId) || (hasTransient && !isActive)) {
-    await reloadCurrentSession();
+    await reloadCurrentSession({ preserveVisibleMessages: true });
   }
 };
 window.__dashboardFinalizeInteractionHydration = async ({ projectToken, sessionId, createdSession } = {}) => {
@@ -586,7 +1274,7 @@ window.__dashboardFinalizeInteractionHydration = async ({ projectToken, sessionI
       await reloadSessionsAndSelect(projectToken, createdSession);
       return;
     }
-    await reloadCurrentSession();
+    await reloadCurrentSession({ preserveVisibleMessages: true });
     return;
   }
 
@@ -608,7 +1296,7 @@ function escapeHtml(str) {
 // ==================== API Calls ====================
 async function fetchJSON(url) {
   try {
-    const res = await fetch(url);
+    const res = await dashboardFetch(url);
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     return await res.json();
   } catch (err) {
@@ -617,9 +1305,17 @@ async function fetchJSON(url) {
   }
 }
 
+async function refreshDashboardCapabilities() {
+  const data = await fetchJSON('/api/capabilities');
+  if (!data) return false;
+  dashboardCapabilities = data;
+  renderSessionActions();
+  return true;
+}
+
 async function createDraftSession(projectDir, source) {
   try {
-    const res = await fetch(`/api/draft-session/${encodeURIComponent(projectDir)}`, {
+    const res = await dashboardFetch(`/api/draft-session/${encodeURIComponent(projectDir)}`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ source }),
@@ -638,7 +1334,7 @@ async function createDraftSession(projectDir, source) {
 
 async function deleteSessionRequest(projectDir, sessionId) {
   try {
-    const res = await fetch(`/api/session/${encodeURIComponent(projectDir)}/${encodeURIComponent(sessionId)}`, {
+    const res = await dashboardFetch(`/api/session/${encodeURIComponent(projectDir)}/${encodeURIComponent(sessionId)}`, {
       method: 'DELETE',
     });
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
@@ -651,7 +1347,7 @@ async function deleteSessionRequest(projectDir, sessionId) {
 
 async function renameSessionRequest(projectDir, sessionId, title) {
   try {
-    const res = await fetch(`/api/session-title/${encodeURIComponent(projectDir)}/${encodeURIComponent(sessionId)}`, {
+    const res = await dashboardFetch(`/api/session-title/${encodeURIComponent(projectDir)}/${encodeURIComponent(sessionId)}`, {
       method: 'PUT',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ title }),
@@ -807,6 +1503,7 @@ function applySessionTitleLocally(sessionId, title, options = {}) {
   if (selectedSession === sessionId) {
     sessionMeta = findSessionMetaById(sessionId) || sessionMeta;
     renderChatHeader(sessionMeta);
+    markSessionSeen(sessionId, sessionMeta, selectedProject);
     persistDashboardState();
   }
 
@@ -859,8 +1556,9 @@ function renderSessionActions() {
     { source: 'claude', label: 'New CC' },
     { source: 'copilot', label: 'New CP' },
   ];
+  const archivedCount = archivedSessionCountForProject(selectedProject);
 
-  container.innerHTML = specs.map(({ source, label }) => {
+  const actions = specs.map(({ source, label }) => {
     const capability = dashboardCapabilities[source];
     const disabled = !capability || !capability.enabled;
     return `
@@ -871,9 +1569,21 @@ function renderSessionActions() {
         ${disabled ? 'disabled' : ''}
       >${escapeHtml(label)}</button>
     `;
-  }).join('');
+  });
 
-  container.querySelectorAll('.session-action-btn').forEach((button) => {
+  if (archivedCount > 0) {
+    actions.push(`
+      <button
+        class="session-action-btn${showArchivedSessions ? ' is-active' : ''}"
+        data-session-action="toggle-archived"
+        title="${showArchivedSessions ? 'Hide archived Codex sessions' : 'Show Codex sessions archived in VS Code'}"
+      >${showArchivedSessions ? `Hide Archived (${archivedCount})` : `Show Archived (${archivedCount})`}</button>
+    `);
+  }
+
+  container.innerHTML = actions.join('');
+
+  container.querySelectorAll('.session-action-btn[data-source]').forEach((button) => {
     button.addEventListener('click', async () => {
       const source = button.dataset.source;
       const draft = await createDraftSession(selectedProject, source);
@@ -884,11 +1594,35 @@ function renderSessionActions() {
       selectSessionById(draft.sessionId, { skipFetch: true });
     });
   });
+
+  container.querySelectorAll('[data-session-action="toggle-archived"]').forEach((button) => {
+    button.addEventListener('click', () => {
+      showArchivedSessions = !showArchivedSessions;
+      persistShowArchivedSessions();
+      renderSessionActions();
+      renderDisplayedSessionList();
+      renderProjectSidebar();
+      updateStatusBar();
+
+      if (!showArchivedSessions && sessionMeta?.archived) {
+        const fallback = defaultSessionForProject(selectedProject);
+        if (fallback && fallback.sessionId !== selectedSession) {
+          selectSessionById(fallback.sessionId, { skipFetch: fallback.isDraft });
+        }
+      }
+    });
+  });
 }
 
 function selectSessionById(sessionId, options = {}) {
   const meta = findSessionMetaById(sessionId);
   if (!meta) return;
+
+  if (meta.archived && !showArchivedSessions) {
+    showArchivedSessions = true;
+    persistShowArchivedSessions();
+    renderSessionActions();
+  }
 
   if (selectedSession && selectedSession !== sessionId) {
     setSessionAutoFollow(selectedSession, isChatNearBottom());
@@ -898,6 +1632,7 @@ function selectSessionById(sessionId, options = {}) {
   selectedSession = sessionId;
   sessionMeta = meta;
   setSessionAutoFollow(sessionId, true);
+  markSessionSeen(sessionId, meta, selectedProject);
   updatePinnedSessionSnapshot(meta, selectedProject);
   renderDisplayedSessionList();
   renderChatHeader(sessionMeta);
@@ -922,7 +1657,9 @@ function selectSessionById(sessionId, options = {}) {
     return;
   }
 
-  if (activeInteractionSessions.has(sessionId) && (transientMessagesBySession.get(sessionId) || []).length > 0 && restoreCachedSessionState(sessionId)) {
+  const restoredCachedState = restoreCachedSessionState(sessionId);
+
+  if (activeInteractionSessions.has(sessionId) && (transientMessagesBySession.get(sessionId) || []).length > 0 && restoredCachedState) {
     return;
   }
 
@@ -931,7 +1668,7 @@ function selectSessionById(sessionId, options = {}) {
   }
 
   if (!options.skipFetch) {
-    loadMessages(selectedProject, sessionId, false);
+    loadMessages(selectedProject, sessionId, false, { preserveVisibleMessages: restoredCachedState });
   }
 }
 
@@ -1032,6 +1769,7 @@ async function refreshProjectsSilently() {
 }
 
 async function loadSessions(projectDir, matcher = null) {
+  const priorDrafts = currentDraftSessions(projectDir).slice();
   cacheSessionState();
   selectedProject = projectDir;
   selectedSession = null;
@@ -1057,19 +1795,22 @@ async function loadSessions(projectDir, matcher = null) {
   }
 
   sessionList = data;
-  sessionDigestSignatureByProject.set(projectDir, buildSessionDigestSignature(sessionList));
+  updateSessionDigestCache(projectDir, sessionList);
+  scheduleDraftMigration(projectDir, sessionList, priorDrafts);
   reconcileDraftSessionsForProject(projectDir, sessionList);
+  const availableSessionIds = new Set(allSessionsForProject(projectDir).map((session) => session.sessionId));
   pinnedSessions = pinnedSessions.filter((session) => {
     if (session.projectDir !== projectDir) return true;
-    return displayedSessionList().some((candidate) => candidate.sessionId === session.sessionId);
+    return availableSessionIds.has(session.sessionId);
   });
   persistPinnedSessions();
+  renderSessionActions();
   renderDisplayedSessionList();
   renderWorkspaceStrip();
   updateStatusBar();
 
   if (matcher) {
-    const matched = matchSessionByMatcher(displayedSessionList(), matcher);
+    const matched = matchSessionByMatcher(allSessionsForProject(projectDir), matcher);
     if (matched) {
       selectSessionById(matched.sessionId, { skipFetch: matched.isDraft });
       return;
@@ -1101,6 +1842,10 @@ async function pollSelectedSessionUpdates() {
   pollInFlight = true;
   try {
     await refreshProjectsSilently();
+    const watched = watchedProjectIds().filter((projectDir) => projectDir && projectDir !== selectedProject);
+    for (const projectDir of watched) {
+      await refreshProjectSessionsSilently(projectDir);
+    }
 
     const previousMeta = selectedSession ? sessionList.find((session) => session.sessionId === selectedSession) || sessionMeta : null;
     await refreshCurrentProjectSessionsSilently();
@@ -1142,17 +1887,21 @@ async function pollSelectedSessionUpdates() {
   }
 }
 
-async function loadMessages(projectDir, sessionId, loadOlder) {
+async function loadMessages(projectDir, sessionId, loadOlder, options = {}) {
   if (isLoading) return;
   isLoading = true;
   const followBeforeRender = shouldAutoFollowSession(sessionId);
+  const preserveVisibleMessages = !loadOlder && !!options.preserveVisibleMessages && selectedSession === sessionId && messages.length > 0;
+  const clearTransientOnSuccess = !loadOlder && !!options.clearTransientOnSuccess;
 
   if (!loadOlder) {
     // Fresh load — get latest messages
     selectedSession = sessionId;
     offset = 0;
-    messages = [];
-    document.getElementById('chat-messages').innerHTML = '<div class="loading">Loading messages...</div>';
+    if (!preserveVisibleMessages) {
+      messages = [];
+      document.getElementById('chat-messages').innerHTML = '<div class="loading">Loading messages...</div>';
+    }
 
     sessionMeta = findSessionMetaById(sessionId);
     renderDisplayedSessionList();
@@ -1167,7 +1916,7 @@ async function loadMessages(projectDir, sessionId, loadOlder) {
   isLoading = false;
 
   if (!data) {
-    if (!loadOlder) {
+    if (!loadOlder && !preserveVisibleMessages) {
       document.getElementById('chat-messages').innerHTML = '<div class="empty-state">Failed to load messages</div>';
     }
     return;
@@ -1182,14 +1931,20 @@ async function loadMessages(projectDir, sessionId, loadOlder) {
     const prevScrollHeight = chatContainer.scrollHeight;
     const prevScrollTop = chatContainer.scrollTop;
     messages = [...data.messages, ...messages];
-    renderCurrentChat();
+    renderCurrentChat({ preserveScroll: false });
     // Maintain scroll position after prepending
     chatContainer.scrollTop = prevScrollTop + (chatContainer.scrollHeight - prevScrollHeight);
   } else {
+    if (clearTransientOnSuccess) {
+      dropTransientMessagesForSession(sessionId, { clearUnread: sessionId === selectedSession });
+    }
     messages = data.messages || [];
-    renderCurrentChat();
+    renderCurrentChat({ preserveScroll: false });
     if (followBeforeRender) {
       scrollChatToBottom();
+    }
+    if (selectedSession === sessionId && sessionMeta) {
+      markSessionSeen(sessionId, sessionMeta, projectDir);
     }
   }
 
@@ -1217,12 +1972,13 @@ function loadMoreMessages() {
 function updateStatusBar() {
   const projectCount = projectList.length;
   const sessionCount = projectList.reduce((sum, p) => sum + (p.sessionCount || 0), 0);
+  const archivedCount = projectList.reduce((sum, p) => sum + (p.archivedSessionCount || 0), 0);
   const sourceSet = new Set();
   projectList.forEach((project) => {
     (project.sources || []).forEach((source) => sourceSet.add(source));
   });
   document.getElementById('status-info').textContent =
-    `${projectCount} projects | ${sessionCount} sessions | ${sourceSet.size} tools`;
+    `${projectCount} projects | ${sessionCount} active sessions${archivedCount ? ` | ${archivedCount} archived` : ''} | ${sourceSet.size} tools`;
 }
 
 function updateStatus(text) {
@@ -1230,15 +1986,82 @@ function updateStatus(text) {
   if (el) el.textContent = text;
 }
 
+function renderBackendStatusBanner() {
+  const banner = document.getElementById('backend-status-banner');
+  if (!banner) return;
+  if (backendHealthy) {
+    banner.textContent = '';
+    banner.classList.add('is-hidden');
+    return;
+  }
+  banner.textContent = backendUnavailableMessage();
+  banner.classList.remove('is-hidden');
+}
+
+async function refreshAfterBackendRecovery() {
+  if (backendRecoveryRefreshInFlight) return;
+  backendRecoveryRefreshInFlight = true;
+  try {
+    await refreshDashboardCapabilities();
+    if (!projectList.length) {
+      await loadProjects();
+      return;
+    }
+
+    await refreshProjectsSilently();
+    if (selectedProject) {
+      await refreshCurrentProjectSessionsSilently();
+    }
+  } finally {
+    backendRecoveryRefreshInFlight = false;
+  }
+}
+
+function setBackendHealth(isHealthy) {
+  const next = !!isHealthy;
+  const changed = backendHealthy !== next;
+  backendHealthy = next;
+  renderBackendStatusBanner();
+  if (changed) {
+    document.dispatchEvent(new CustomEvent('dashboard:backend-health', {
+      detail: { healthy: backendHealthy },
+    }));
+  }
+
+  if (!changed || !backendHealthy) return;
+  refreshAfterBackendRecovery().catch((err) => {
+    console.error('Backend recovery refresh failed', err);
+  });
+}
+
+async function checkBackendHealth() {
+  try {
+    const res = await dashboardFetch('/api/health', { cache: 'no-store' });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    setBackendHealth(true);
+  } catch (err) {
+    setBackendHealth(false);
+    if (!isLikelyBackendUnavailableError(err)) {
+      console.error('Health check failed', err);
+    }
+  }
+}
+
 // ==================== Init ====================
 document.addEventListener('DOMContentLoaded', () => {
   draftSessions = loadPersistedDraftSessions();
   pinnedSessions = loadPersistedPinnedSessions();
+  showArchivedSessions = loadPersistedShowArchivedSessions();
+  seenSessionSignatures = loadPersistedSeenSessionSignatures();
+  seenProjectLatest = loadPersistedSeenProjectLatest();
+  setBootstrapMessage('Loading dashboard shell...');
+  renderBackendStatusBanner();
   renderWorkspaceStrip();
 
-  fetchJSON('/api/capabilities').then((data) => {
-    dashboardCapabilities = data;
-    renderSessionActions();
+  checkBackendHealth();
+
+  refreshDashboardCapabilities().catch((err) => {
+    reportBootstrapError(err, 'Failed to load dashboard capabilities.');
   });
 
   // Wire up project selection
@@ -1284,9 +2107,20 @@ document.addEventListener('DOMContentLoaded', () => {
   }
 
   // Load projects on start
-  loadProjects();
+  setBootstrapMessage('Loading projects...');
+  loadProjects()
+    .then(() => {
+      markBootstrapComplete();
+    })
+    .catch((err) => {
+      reportBootstrapError(err, 'Failed to load dashboard projects.');
+    });
 
   window.setInterval(() => {
     pollSelectedSessionUpdates();
   }, POLL_INTERVAL_MS);
+
+  window.setInterval(() => {
+    checkBackendHealth();
+  }, BACKEND_HEALTH_INTERVAL_MS);
 });

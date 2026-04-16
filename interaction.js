@@ -1,14 +1,30 @@
 import { spawn } from 'node:child_process';
 import fsp from 'node:fs/promises';
 import path from 'node:path';
-import { tmpdir } from 'node:os';
+import os, { tmpdir } from 'node:os';
 import { randomUUID } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
+import { loadRuntimeConfig } from './config.js';
 
 const MAX_BODY_BYTES = 25 * 1024 * 1024;
 const MAX_IMAGES = 6;
+const _cfg = loadRuntimeConfig();
+const WORKSPACE_ROOT = _cfg.workspaceRoot || os.homedir();
+const COPILOT_BINARY = _cfg.copilotBin || 'copilot';
+const COPILOT_CONFIG_DIR = _cfg.copilotConfigDir;
+const COPILOT_CONFIG_FILE = _cfg.copilotConfigFile;
+const VSCODE_EXTENSIONS_DIR = _cfg.vscodeExtensionsDir;
+const VSCODE_CODEX_EXTENSION_PREFIX = 'openai.chatgpt-';
+const DEFAULT_CODEX_BINARY = _cfg.codexBin || 'codex';
+const DEFAULT_CODEX_ORIGINATOR = 'codex_vscode';
+const CODEX_REQUEST_TIMEOUT_MS = 30000;
+const CODEX_THREAD_RESUME_TIMEOUT_MS = 60000;
+const CODEX_THREAD_RESUME_MAX_ATTEMPTS = 2;
+const CODEX_THREAD_RESUME_RETRY_DELAY_MS = 800;
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const CLAUDE_MODELS_FILE = _cfg.claudeModelsFile;
 const CLAUDE_PROVENANCE_FILE = path.join(__dirname, 'data', 'claude-session-provenance.json');
+let resolvedCodexBinaryPromise = null;
 
 function safeJsonParse(text) {
   try {
@@ -39,15 +55,83 @@ async function pathExists(filePath) {
   }
 }
 
+function delay(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function codexBinaryName() {
+  return process.platform === 'win32' ? 'codex.exe' : 'codex';
+}
+
+function codexBinarySubdir() {
+  let platformPart = null;
+  if (process.platform === 'darwin') platformPart = 'macos';
+  if (process.platform === 'linux') platformPart = 'linux';
+  if (process.platform === 'win32') platformPart = 'windows';
+
+  let archPart = null;
+  if (process.arch === 'x64') archPart = 'x86_64';
+  if (process.arch === 'arm64') archPart = 'aarch64';
+
+  if (!platformPart || !archPart) return '';
+  return `${platformPart}-${archPart}`;
+}
+
+async function resolveCodexBinary() {
+  if (resolvedCodexBinaryPromise) {
+    return resolvedCodexBinaryPromise;
+  }
+
+  resolvedCodexBinaryPromise = (async () => {
+    const manualOverride = process.env.SESSION_DASHBOARD_CODEX_BINARY?.trim();
+    if (manualOverride) {
+      return manualOverride;
+    }
+
+    const binSubdir = codexBinarySubdir();
+    if (!binSubdir) {
+      return DEFAULT_CODEX_BINARY;
+    }
+
+    try {
+      const entries = await fsp.readdir(VSCODE_EXTENSIONS_DIR, { withFileTypes: true });
+      const extensionDirs = entries
+        .filter((entry) => entry.isDirectory() && entry.name.startsWith(VSCODE_CODEX_EXTENSION_PREFIX))
+        .map((entry) => entry.name)
+        .sort()
+        .reverse();
+
+      for (const dirName of extensionDirs) {
+        const candidate = path.join(
+          VSCODE_EXTENSIONS_DIR,
+          dirName,
+          'bin',
+          binSubdir,
+          codexBinaryName(),
+        );
+        if (await pathExists(candidate)) {
+          return candidate;
+        }
+      }
+    } catch {
+      // Fall back to whatever `codex` resolves to on PATH.
+    }
+
+    return DEFAULT_CODEX_BINARY;
+  })();
+
+  return resolvedCodexBinaryPromise;
+}
+
 function extractCopilotModel(message) {
   if (typeof message !== 'string') return '';
   const match = message.match(/Model changed to:\s*(.+)$/);
   return match ? match[1].trim() : message.trim();
 }
 
-async function getCopilotToken(runtimeConfig) {
+async function getCopilotToken() {
   try {
-    const raw = await fsp.readFile(runtimeConfig.copilotConfigFile, 'utf-8');
+    const raw = await fsp.readFile(COPILOT_CONFIG_FILE, 'utf-8');
     const config = JSON.parse(raw);
     const token = Object.values(config.copilot_tokens || {})[0];
     return typeof token === 'string' && token ? token : '';
@@ -56,8 +140,8 @@ async function getCopilotToken(runtimeConfig) {
   }
 }
 
-export async function getInteractionCapabilities(runtimeConfig) {
-  const copilotToken = await getCopilotToken(runtimeConfig);
+export async function getInteractionCapabilities() {
+  const copilotToken = await getCopilotToken();
   const copilotReady = !!copilotToken;
 
   return {
@@ -163,16 +247,9 @@ function buildSessionKey(locator) {
   });
 }
 
-function resolveClaudeModelsFile(runtimeConfig) {
-  if (runtimeConfig?.claudeModelsFile) return runtimeConfig.claudeModelsFile;
-  const projectsDir = runtimeConfig?.claudeProjectsDir || '';
-  const normalized = path.resolve(projectsDir);
-  return path.join(path.dirname(path.dirname(normalized)), '.models.json');
-}
-
-async function loadClaudeProfiles(runtimeConfig) {
+async function loadClaudeProfiles() {
   try {
-    const raw = await fsp.readFile(resolveClaudeModelsFile(runtimeConfig), 'utf-8');
+    const raw = await fsp.readFile(CLAUDE_MODELS_FILE, 'utf-8');
     const parsed = safeJsonObject(raw);
     return parsed.models && typeof parsed.models === 'object' ? parsed.models : {};
   } catch {
@@ -194,8 +271,8 @@ async function persistClaudeProvenance(provenance) {
   await fsp.writeFile(CLAUDE_PROVENANCE_FILE, JSON.stringify(provenance, null, 2) + '\n', 'utf-8');
 }
 
-async function resolveClaudeLaunchContext(runtimeConfig, locator, sessionMeta = null, profileOverride = '') {
-  const models = await loadClaudeProfiles(runtimeConfig);
+async function resolveClaudeLaunchContext(locator, sessionMeta = null, profileOverride = '') {
+  const models = await loadClaudeProfiles();
   const provenance = await loadClaudeProvenance();
   const key = buildSessionKey(locator);
   const saved = key ? provenance[key] || null : null;
@@ -204,12 +281,7 @@ async function resolveClaudeLaunchContext(runtimeConfig, locator, sessionMeta = 
     const env = models[profileOverride].env || {};
     return {
       profile: profileOverride,
-      profileLabel: (profileOverride === 'aliyun' ? 'ALIYUN'
-        : profileOverride === 'cliproxy' ? 'CLIPROXY'
-        : profileOverride === 'gpt' ? 'GPT'
-        : profileOverride === 'api3' ? 'API3'
-        : profileOverride === 'fujie' ? 'FUJIE'
-        : profileOverride.toUpperCase()),
+      profileLabel: profileOverride.toUpperCase(),
       anthropicModel: env.ANTHROPIC_MODEL || '',
       baseUrl: env.ANTHROPIC_BASE_URL || '',
       env,
@@ -379,10 +451,10 @@ function createClaudeArgs(locator, prompt, uploadDir) {
   return args;
 }
 
-function createCopilotArgs(locator, prompt, uploadDir, runtimeConfig) {
+function createCopilotArgs(locator, prompt, uploadDir) {
   const args = [
     '--config-dir',
-    runtimeConfig.copilotConfigDir,
+    COPILOT_CONFIG_DIR,
     `--resume=${locator.rawSessionId}`,
     '-p',
     prompt,
@@ -399,8 +471,8 @@ function createCopilotArgs(locator, prompt, uploadDir, runtimeConfig) {
   return args;
 }
 
-function defaultCwd(locator, runtimeConfig) {
-  return locator.projectPath && locator.projectPath !== '(unknown)' ? locator.projectPath : runtimeConfig.workspaceRoot;
+function defaultCwd(locator) {
+  return locator.projectPath && locator.projectPath !== '(unknown)' ? locator.projectPath : WORKSPACE_ROOT;
 }
 
 function formatCommandForDisplay(command) {
@@ -470,12 +542,524 @@ function parseCodexLine(line, res) {
     return;
   }
   if (obj.type === 'item.completed' && obj.item?.type === 'agent_message') {
-    sendEvent(res, { type: 'assistant_final', text: obj.item.text || '' });
+    sendEvent(res, {
+      type: 'assistant_final',
+      text: obj.item.text || '',
+      itemId: obj.item.id || '',
+      phase: obj.item.phase || '',
+    });
     return;
   }
   if (obj.type === 'turn.completed') {
     sendEvent(res, { type: 'status', message: 'Codex turn completed.' });
   }
+}
+
+function extractCodexExtensionVersion(codexBinary) {
+  if (typeof codexBinary !== 'string') return 'unknown';
+  const match = codexBinary.match(/openai\.chatgpt-([^/]+)/);
+  return match?.[1] || process.env.SESSION_DASHBOARD_CODEX_EXTENSION_VERSION || 'unknown';
+}
+
+function codexClientInfo(codexBinary) {
+  return {
+    name: 'VS Code',
+    title: 'Codex Extension',
+    version: extractCodexExtensionVersion(codexBinary),
+  };
+}
+
+function resolveCodexThreadTarget(locator, sessionMeta = null) {
+  const rawSessionId = (sessionMeta?.rawSessionId || locator?.rawSessionId || '').trim();
+  if (rawSessionId) {
+    return {
+      mode: 'resume',
+      rawSessionId,
+    };
+  }
+  return {
+    mode: 'start',
+    rawSessionId: '',
+  };
+}
+
+function buildCodexInputItems(text, imageFiles) {
+  const items = [];
+  const trimmed = typeof text === 'string' ? text.trim() : '';
+  const fallbackText = imageFiles.length > 0
+    ? 'Please inspect the attached image file(s) and help the user with them.'
+    : '';
+  const contentText = trimmed || fallbackText;
+
+  if (contentText) {
+    items.push({
+      type: 'text',
+      text: contentText,
+      text_elements: [],
+    });
+  }
+
+  for (const image of imageFiles) {
+    if (!image?.path) continue;
+    items.push({
+      type: 'localImage',
+      path: image.path,
+    });
+  }
+
+  return items;
+}
+
+function formatAppServerCommandResult(item) {
+  const exitCode = Number.isInteger(item?.exitCode) ? item.exitCode : null;
+  const output = typeof item?.aggregatedOutput === 'string' ? item.aggregatedOutput.trim() : '';
+  const parts = [];
+  if (exitCode != null) parts.push(`Result: Exit code ${exitCode}`);
+  if (output) {
+    parts.push('```text');
+    parts.push(output);
+    parts.push('```');
+  }
+  return parts.join('\n');
+}
+
+function formatAppServerFileChanges(item) {
+  const changes = Array.isArray(item?.changes) ? item.changes : [];
+  if (!changes.length) return 'Updated files.';
+  const lines = changes.map((change) => `- ${change.path}${change.kind ? ` (${change.kind})` : ''}`);
+  return `Updated files:\n${lines.join('\n')}`;
+}
+
+function buildCodexTokenUsageMessage(tokenUsage) {
+  const last = tokenUsage?.last;
+  if (!last || !Number.isFinite(last.inputTokens)) return '';
+  const cached = Number.isFinite(last.cachedInputTokens) ? last.cachedInputTokens : 0;
+  const total = last.inputTokens;
+  if (total <= 0) return '';
+  const percent = Math.round((cached / total) * 100);
+  return `Cache hit: ${cached}/${total} input tokens (${percent}%).`;
+}
+
+function buildCodexAppServerEnv(extraEnv = {}) {
+  const env = { ...process.env, ...(extraEnv || {}) };
+  delete env.TERM;
+  delete env.COLORTERM;
+  delete env.TERM_PROGRAM;
+  delete env.TERM_PROGRAM_VERSION;
+  delete env.CODEX_CI;
+  delete env.CODEX_THREAD_ID;
+  return env;
+}
+
+function shouldIgnoreCodexAppServerLogLine(text) {
+  if (!text) return false;
+
+  return [
+    /chatgpt authentication required to sync remote plugins; api key auth is not supported/i,
+    /failed to warm featured plugin ids cache/i,
+    /remote plugin sync request to https:\/\/chatgpt\.com\/backend-api\/plugins\/featured/i,
+    /challenge-error-text/i,
+    /Enable JavaScript and cookies to continue/i,
+    /Failed to delete shell snapshot .*No such file or directory/i,
+    /sqlx::query: slow statement: execution time exceeded alert threshold/i,
+    /INSERT INTO logs \(ts,/i,
+  ].some((pattern) => pattern.test(text));
+}
+
+async function streamCodexAppServerInteraction(res, req, options) {
+  return new Promise((resolve) => {
+    let finished = false;
+    let clientDisconnected = false;
+    let forcedKillTimer = null;
+    let nextRequestId = 1;
+    let turnCompleted = false;
+    let sentSessionCreated = false;
+    let currentThreadId = '';
+    const pendingRequests = new Map();
+    const childEnv = buildCodexAppServerEnv(options.env);
+    const child = spawn(options.command, ['app-server', '--analytics-default-enabled'], {
+      cwd: options.cwd,
+      env: childEnv,
+      stdio: ['pipe', 'pipe', 'pipe'],
+    });
+
+    const finish = (payload) => {
+      if (finished) return;
+      finished = true;
+      if (forcedKillTimer) {
+        clearTimeout(forcedKillTimer);
+        forcedKillTimer = null;
+      }
+      for (const { reject, timer } of pendingRequests.values()) {
+        clearTimeout(timer);
+        reject(new Error('Codex app-server interaction ended before the request completed.'));
+      }
+      pendingRequests.clear();
+      if (!clientDisconnected) {
+        if (payload) sendEvent(res, payload);
+        res.end();
+      }
+      resolve();
+    };
+
+    const stopChild = () => {
+      if (child.killed || child.exitCode != null) return;
+      try {
+        child.kill('SIGTERM');
+      } catch {
+        return;
+      }
+      forcedKillTimer = setTimeout(() => {
+        if (!child.killed && child.exitCode == null) {
+          try {
+            child.kill('SIGKILL');
+          } catch {
+            // ignore
+          }
+        }
+      }, 1500);
+      forcedKillTimer.unref?.();
+    };
+
+    const writeMessage = (message) => {
+      if (finished || clientDisconnected || child.stdin.destroyed) {
+        throw new Error('Codex app-server stdin is unavailable.');
+      }
+      child.stdin.write(JSON.stringify(message) + '\n');
+    };
+
+    const sendRequest = (method, params, timeoutMs = CODEX_REQUEST_TIMEOUT_MS) => {
+      const id = String(nextRequestId++);
+      return new Promise((resolveRequest, rejectRequest) => {
+        const timer = setTimeout(() => {
+          pendingRequests.delete(id);
+          rejectRequest(new Error(`Timed out waiting for ${method} response.`));
+        }, timeoutMs);
+        pendingRequests.set(id, { resolve: resolveRequest, reject: rejectRequest, timer, method });
+        try {
+          writeMessage({ id, method, params });
+        } catch (err) {
+          clearTimeout(timer);
+          pendingRequests.delete(id);
+          rejectRequest(err);
+        }
+      });
+    };
+
+    const sendNotification = (method, params) => {
+      writeMessage(params === undefined ? { method } : { method, params });
+    };
+
+    const sendResponse = (id, result) => {
+      writeMessage({ id, result });
+    };
+
+    const sendErrorResponse = (id, message, code = -32603) => {
+      writeMessage({
+        id,
+        error: {
+          code,
+          message,
+        },
+      });
+    };
+
+    const handleServerRequest = (message) => {
+      const method = message?.method;
+      const id = message?.id;
+      if (id == null || !method) return;
+
+      if (
+        method === 'item/commandExecution/requestApproval' ||
+        method === 'item/fileChange/requestApproval' ||
+        method === 'execCommandApproval' ||
+        method === 'applyPatchApproval'
+      ) {
+        sendResponse(id, { decision: 'denied' });
+        return;
+      }
+
+      if (method === 'item/permissions/requestApproval') {
+        sendResponse(id, { permissions: {}, scope: 'turn' });
+        return;
+      }
+
+      if (method === 'item/tool/requestUserInput') {
+        sendResponse(id, { answers: {} });
+        return;
+      }
+
+      if (method === 'mcpServer/elicitation/request') {
+        sendResponse(id, { action: 'cancel', content: null, _meta: null });
+        return;
+      }
+
+      if (method === 'item/tool/call') {
+        sendResponse(id, { contentItems: [], success: false });
+        return;
+      }
+
+      sendErrorResponse(id, `Unsupported app-server request: ${method}`, -32601);
+    };
+
+    const handleNotification = (message) => {
+      const method = message?.method;
+      const params = message?.params || {};
+      if (!method) return;
+
+      if (method === 'thread/started') {
+        currentThreadId = params?.thread?.id || currentThreadId;
+        sendEvent(res, { type: 'meta', source: 'codex', sessionId: currentThreadId });
+        if (options.threadTarget.mode === 'start' && currentThreadId && !sentSessionCreated) {
+          sentSessionCreated = true;
+          sendEvent(res, { type: 'session_created', source: 'codex', rawSessionId: currentThreadId });
+        }
+        return;
+      }
+
+      if (method === 'turn/started') {
+        sendEvent(res, {
+          type: 'status',
+          message: options.threadTarget.mode === 'start'
+            ? 'Codex started a new session.'
+            : 'Codex resumed the selected session.',
+        });
+        return;
+      }
+
+      if (method === 'item/agentMessage/delta' && params?.delta) {
+        sendEvent(res, {
+          type: 'assistant_delta',
+          text: params.delta,
+          itemId: params.itemId || '',
+        });
+        return;
+      }
+
+      if (method === 'item/started' && params?.item?.type === 'commandExecution') {
+        sendEvent(res, {
+          type: 'tool_event',
+          message: `shell_command\n\`\`\`bash\n${formatCommandForDisplay(params.item.command)}\n\`\`\``,
+        });
+        return;
+      }
+
+      if (method === 'item/completed' && params?.item?.type === 'commandExecution') {
+        sendEvent(res, {
+          type: 'tool_result',
+          message: formatAppServerCommandResult(params.item),
+        });
+        return;
+      }
+
+      if (method === 'item/completed' && params?.item?.type === 'fileChange') {
+        sendEvent(res, {
+          type: 'tool_event',
+          message: `apply_patch\n${formatAppServerFileChanges(params.item)}`,
+        });
+        return;
+      }
+
+      if (method === 'item/completed' && params?.item?.type === 'agentMessage') {
+        sendEvent(res, {
+          type: 'assistant_final',
+          text: params.item.text || '',
+          itemId: params.item.id || '',
+          phase: params.item.phase || '',
+        });
+        return;
+      }
+
+      if (method === 'thread/tokenUsage/updated') {
+        const usageMessage = buildCodexTokenUsageMessage(params?.tokenUsage);
+        if (usageMessage) {
+          sendEvent(res, { type: 'status', message: usageMessage });
+        }
+        return;
+      }
+
+      if (method === 'error') {
+        const details = params?.message || params?.error || 'Codex app-server interaction failed.';
+        sendEvent(res, { type: 'error', message: truncateText(normalizeText(details), 800) });
+        return;
+      }
+
+      if (method === 'turn/completed') {
+        turnCompleted = true;
+        sendEvent(res, { type: 'status', message: 'Codex turn completed.' });
+        stopChild();
+        finish({ type: 'done', exitCode: 0 });
+      }
+    };
+
+    req.on('aborted', () => {
+      clientDisconnected = true;
+      stopChild();
+    });
+
+    res.on('close', () => {
+      if (finished) return;
+      clientDisconnected = true;
+      stopChild();
+    });
+
+    processJsonLines(child.stdout, (line) => {
+      if (clientDisconnected || finished) return;
+      const message = safeJsonParse(line);
+      if (!message) {
+        sendEvent(res, { type: 'status', message: truncateText(line, 400) });
+        return;
+      }
+
+      if (Object.prototype.hasOwnProperty.call(message, 'id') &&
+          (Object.prototype.hasOwnProperty.call(message, 'result') || Object.prototype.hasOwnProperty.call(message, 'error'))) {
+        const id = String(message.id);
+        const pending = pendingRequests.get(id);
+        if (!pending) return;
+        clearTimeout(pending.timer);
+        pendingRequests.delete(id);
+        if (message.error) {
+          pending.reject(new Error(message.error.message || `${pending.method} failed.`));
+          return;
+        }
+        pending.resolve(message.result);
+        return;
+      }
+
+      if (Object.prototype.hasOwnProperty.call(message, 'id')) {
+        handleServerRequest(message);
+        return;
+      }
+
+      if (message.method) {
+        handleNotification(message);
+      }
+    });
+
+    let stderr = '';
+    child.stderr.on('data', (chunk) => {
+      const lines = chunk
+        .toString('utf-8')
+        .split(/\r?\n/)
+        .map((line) => line.trim())
+        .filter(Boolean)
+        .filter((line) => !shouldIgnoreCodexAppServerLogLine(line));
+
+      if (!lines.length) return;
+
+      const text = lines.join('\n');
+      stderr += (stderr ? '\n' : '') + text;
+      if (clientDisconnected || finished) return;
+
+      for (const line of lines) {
+        sendEvent(res, { type: 'status', message: truncateText(line, 400) });
+      }
+    });
+
+    child.on('error', (err) => {
+      finish({ type: 'error', message: err.message || 'Failed to start Codex app-server.' });
+    });
+
+    child.on('close', (code) => {
+      if (finished) return;
+      if (turnCompleted || code === 0) {
+        finish({ type: 'done', exitCode: code || 0 });
+        return;
+      }
+      finish({
+        type: 'error',
+        message: stderr || `Codex app-server exited with code ${code}`,
+      });
+    });
+
+    (async () => {
+      const initResult = await sendRequest('initialize', {
+        clientInfo: codexClientInfo(options.command),
+        capabilities: {
+          experimentalApi: true,
+        },
+      });
+      sendNotification('initialized');
+      sendEvent(res, { type: 'meta', source: 'codex', sessionId: currentThreadId || '' });
+      sendEvent(res, {
+        type: 'status',
+        message: `Connected to Codex app-server (${initResult?.platformOs || 'unknown platform'}).`,
+      });
+
+      let threadId = options.threadTarget.rawSessionId;
+      if (options.threadTarget.mode === 'start') {
+        const thread = await sendRequest('thread/start', {
+          cwd: options.cwd,
+          approvalPolicy: 'never',
+          sandbox: 'danger-full-access',
+          experimentalRawEvents: false,
+          persistExtendedHistory: true,
+        });
+        threadId = thread?.thread?.id || threadId;
+        currentThreadId = threadId || currentThreadId;
+        if (threadId && !sentSessionCreated) {
+          sentSessionCreated = true;
+          sendEvent(res, { type: 'session_created', source: 'codex', rawSessionId: threadId });
+        }
+      } else {
+        let thread = null;
+        let lastResumeError = null;
+        for (let attempt = 1; attempt <= CODEX_THREAD_RESUME_MAX_ATTEMPTS; attempt += 1) {
+          sendEvent(res, {
+            type: 'status',
+            message: attempt === 1
+              ? 'Resuming selected Codex session...'
+              : `Retrying Codex session resume (${attempt}/${CODEX_THREAD_RESUME_MAX_ATTEMPTS})...`,
+          });
+          try {
+            thread = await sendRequest('thread/resume', {
+              threadId,
+              cwd: options.cwd,
+              approvalPolicy: 'never',
+              sandbox: 'danger-full-access',
+              persistExtendedHistory: true,
+            }, CODEX_THREAD_RESUME_TIMEOUT_MS);
+            break;
+          } catch (err) {
+            lastResumeError = err;
+            if (attempt >= CODEX_THREAD_RESUME_MAX_ATTEMPTS) {
+              throw err;
+            }
+            sendEvent(res, {
+              type: 'status',
+              message: `${err.message || 'Codex resume failed.'} Retrying...`,
+            });
+            await delay(CODEX_THREAD_RESUME_RETRY_DELAY_MS);
+          }
+        }
+        if (!thread && lastResumeError) {
+          throw lastResumeError;
+        }
+        threadId = thread?.thread?.id || threadId;
+        currentThreadId = threadId || currentThreadId;
+      }
+
+      if (!threadId) {
+        throw new Error('Codex app-server did not return a thread id.');
+      }
+
+      const input = buildCodexInputItems(options.text, options.imageFiles);
+      if (!input.length) {
+        throw new Error('No Codex input items were generated for this interaction.');
+      }
+
+      await sendRequest('turn/start', {
+        threadId,
+        input,
+        cwd: options.cwd,
+        approvalPolicy: 'never',
+        sandboxPolicy: { type: 'dangerFullAccess' },
+      });
+    })().catch((err) => {
+      finish({ type: 'error', message: err.message || 'Codex app-server interaction failed.' });
+      stopChild();
+    });
+  });
 }
 
 function parseClaudeLine(line, res) {
@@ -674,8 +1258,7 @@ export async function handleInteractionRequest(req, res, { project, locator, con
     const sessionMeta = body.sessionMeta && typeof body.sessionMeta === 'object' ? body.sessionMeta : null;
     const claudeProfileOverride = typeof body.claudeProfileOverride === 'string' ? body.claudeProfileOverride.trim() : '';
     const { dir: uploadDir, files: imageFiles } = await materializeImages(images);
-    const preferredCwd = defaultCwd(locator, config);
-    const cwd = (await pathExists(preferredCwd)) ? preferredCwd : config.workspaceRoot;
+    const cwd = (await pathExists(defaultCwd(locator))) ? defaultCwd(locator) : WORKSPACE_ROOT;
 
     if (images.length > 0) {
       sendEvent(res, {
@@ -709,8 +1292,8 @@ export async function handleInteractionRequest(req, res, { project, locator, con
     }
 
     if (locator.source === 'codex') {
-      const prompt = buildPrompt(text, imageFiles, true);
-      const args = createCodexArgs(locator, prompt, imageFiles);
+      const codexBinary = await resolveCodexBinary();
+      const threadTarget = resolveCodexThreadTarget(locator, sessionMeta);
       sendEvent(res, { type: 'status', message: 'Starting Codex interaction...' });
       if (imageFiles.length > 0) {
         sendEvent(res, {
@@ -724,9 +1307,16 @@ export async function handleInteractionRequest(req, res, { project, locator, con
           message: `Attached ${imageCountText(imageFiles.length)} to the Codex request.`,
         });
       }
-      await streamProcess(res, req, config.codexBin, args, {
+      await streamCodexAppServerInteraction(res, req, {
+        command: codexBinary,
         cwd,
-        parseLine: parseCodexLine,
+        text,
+        imageFiles,
+        threadTarget,
+        env: {
+          CODEX_INTERNAL_ORIGINATOR_OVERRIDE:
+            process.env.CODEX_INTERNAL_ORIGINATOR_OVERRIDE || DEFAULT_CODEX_ORIGINATOR,
+        },
       });
       return;
     }
@@ -734,7 +1324,7 @@ export async function handleInteractionRequest(req, res, { project, locator, con
     if (locator.source === 'claude') {
       const prompt = buildPrompt(text, imageFiles, false);
       const args = createClaudeArgs(locator, prompt, uploadDir);
-      const claudeLaunch = await resolveClaudeLaunchContext(config, locator, sessionMeta, claudeProfileOverride);
+      const claudeLaunch = await resolveClaudeLaunchContext(locator, sessionMeta, claudeProfileOverride);
       sendEvent(res, { type: 'status', message: 'Starting Claude interaction...' });
       if (claudeLaunch.profileLabel || claudeLaunch.anthropicModel) {
         const summary = [
@@ -757,7 +1347,7 @@ export async function handleInteractionRequest(req, res, { project, locator, con
           message: `Saved ${imageCountText(imageFiles.length)} to local temp files for Claude to inspect.`,
         });
       }
-      await streamProcess(res, req, config.claudeBin, args, {
+      await streamProcess(res, req, 'claude', args, {
         cwd,
         env: claudeLaunch.env || {},
         parseLine: parseClaudeLine,
@@ -769,7 +1359,7 @@ export async function handleInteractionRequest(req, res, { project, locator, con
     }
 
     if (locator.source === 'copilot') {
-      const token = await getCopilotToken(config);
+      const token = await getCopilotToken();
       if (!token) {
         sendEvent(res, {
           type: 'error',
@@ -780,7 +1370,7 @@ export async function handleInteractionRequest(req, res, { project, locator, con
       }
 
       const prompt = buildPrompt(text, imageFiles, false);
-      const args = createCopilotArgs(locator, prompt, uploadDir, config);
+      const args = createCopilotArgs(locator, prompt, uploadDir);
       sendEvent(res, { type: 'status', message: 'Starting Copilot interaction...' });
       if (imageFiles.length > 0) {
         sendEvent(res, {
@@ -797,7 +1387,7 @@ export async function handleInteractionRequest(req, res, { project, locator, con
       if (locator.draft && locator.rawSessionId) {
         sendEvent(res, { type: 'session_created', source: 'copilot', rawSessionId: locator.rawSessionId });
       }
-      await streamProcess(res, req, config.copilotBin, args, {
+      await streamProcess(res, req, COPILOT_BINARY, args, {
         cwd,
         env: { COPILOT_GITHUB_TOKEN: token },
         parseLine: parseCopilotLine,

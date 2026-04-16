@@ -7,7 +7,7 @@ const PROJECT_SOURCE_LABELS = {
   copilot: 'CP',
 };
 
-function renderProjectList(projects, selectedDir, activeProjectIds = new Set()) {
+function renderProjectList(projects, selectedDir, activeProjectIds = new Set(), unreadProjects = new Map()) {
   const container = document.getElementById('project-list');
   if (!projects || projects.length === 0) {
     container.innerHTML = '<div class="empty-state">No projects found</div>';
@@ -17,6 +17,8 @@ function renderProjectList(projects, selectedDir, activeProjectIds = new Set()) 
   container.innerHTML = projects.map(p => {
     const isActive = p.dirName === selectedDir;
     const hasLive = activeProjectIds.has(p.dirName);
+    const unreadCount = unreadProjects.get(p.dirName) || 0;
+    const archivedCount = p.archivedSessionCount || 0;
     const name = escapeHtml(p.name);
     const sourceBadges = (p.sources || []).map((source) => {
       const short = PROJECT_SOURCE_LABELS[source] || source.slice(0, 2).toUpperCase();
@@ -30,15 +32,17 @@ function renderProjectList(projects, selectedDir, activeProjectIds = new Set()) 
     }).join('');
 
     return `
-      <div class="project-item${isActive ? ' active' : ''}${hasLive ? ' has-live' : ''}" data-dir="${escapeHtml(p.dirName)}">
+      <div class="project-item${isActive ? ' active' : ''}${hasLive ? ' has-live' : ''}${unreadCount ? ' has-unread' : ''}" data-dir="${escapeHtml(p.dirName)}">
         <div class="project-main">
           <span class="project-name" title="${escapeHtml(p.path)}">${name}</span>
           <div class="project-source-row">
             ${hasLive ? '<span class="project-live-badge">LIVE</span>' : ''}
+            ${unreadCount ? `<span class="project-unread-badge">${unreadCount > 9 ? '9+' : unreadCount}</span>` : ''}
+            ${archivedCount ? `<span class="project-archived-badge" title="${archivedCount} archived session${archivedCount === 1 ? '' : 's'} hidden from the main list by default">AR ${archivedCount}</span>` : ''}
             ${sourceBadges}
           </div>
         </div>
-        <span class="project-count">${p.sessionCount}</span>
+        <span class="project-count" title="${archivedCount ? `${p.sessionCount} active · ${archivedCount} archived` : `${p.sessionCount} active`}">${p.sessionCount}</span>
       </div>
     `;
   }).join('');

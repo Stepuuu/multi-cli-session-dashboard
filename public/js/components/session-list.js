@@ -4,16 +4,22 @@ let _onSessionSelectCb = null;
 let _onSessionDeleteCb = null;
 let _onSessionPinCb = null;
 
-function renderSessionList(sessions, selectedId, activeSessionIds = new Set(), pinnedSessionIds = new Set()) {
+function renderSessionList(sessions, selectedId, activeSessionIds = new Set(), pinnedSessionIds = new Set(), unreadSessionIds = new Set(), options = {}) {
   const container = document.getElementById('session-list');
   if (!sessions || sessions.length === 0) {
-    container.innerHTML = '<div class="empty-state">No sessions found</div>';
+    if (options.hiddenArchivedCount > 0) {
+      container.innerHTML = `<div class="empty-state">No active sessions shown. ${options.hiddenArchivedCount} archived session${options.hiddenArchivedCount === 1 ? '' : 's'} hidden.</div>`;
+    } else {
+      container.innerHTML = '<div class="empty-state">No sessions found</div>';
+    }
     return;
   }
 
   container.innerHTML = sessions.map(s => {
     const isActive = s.sessionId === selectedId;
     const isBusy = activeSessionIds.has(s.sessionId);
+    const isUnread = unreadSessionIds.has(s.sessionId);
+    const isArchived = !!s.archived;
     const prompt = escapeHtml(truncate(s.firstPrompt || '(no prompt)', 60));
     const date = formatRelativeDate(s.modified || s.created);
     const summary = s.summary ? escapeHtml(truncate(s.summary, 80)) : '';
@@ -24,25 +30,70 @@ function renderSessionList(sessions, selectedId, activeSessionIds = new Set(), p
     const liveBadge = isBusy ? '<span class="session-live-badge">LIVE</span>' : '';
     const pinLabel = pinnedSessionIds.has(s.sessionId) ? 'Unpin' : 'Pin';
     const pinClass = pinnedSessionIds.has(s.sessionId) ? ' is-pinned' : '';
+    const titleTooltip = typeof window.__dashboardBuildSessionTitleTooltip === 'function'
+      ? window.__dashboardBuildSessionTitleTooltip(s)
+      : (s.firstPrompt || '');
+    const cacheInfo = typeof window.__dashboardSessionCacheInfo === 'function'
+      ? window.__dashboardSessionCacheInfo(s)
+      : null;
+    const cacheTooltip = typeof window.__dashboardBuildSessionCacheTooltip === 'function'
+      ? window.__dashboardBuildSessionCacheTooltip(s)
+      : '';
+    const cacheBadge = cacheInfo
+      ? `<span class="session-cache-badge" title="${escapeHtml(cacheTooltip)}">CACHE ${cacheInfo.percent}%</span>`
+      : '';
+    const archivedBadge = isArchived
+      ? `<span class="session-archived-badge" title="Archived in VS Code Codex">ARCHIVED</span>`
+      : '';
+    const forkTooltip = typeof window.__dashboardBuildSessionForkTooltip === 'function'
+      ? window.__dashboardBuildSessionForkTooltip(s)
+      : '';
+    const forkBadge = s.forkedFromId
+      ? `<span class="session-fork-badge" title="${escapeHtml(forkTooltip || `Forked from ${s.forkedFromId}`)}">FORK ${escapeHtml(String(s.forkedFromId).slice(0, 8))}</span>`
+      : '';
+    const fileSizeLabel = typeof window.__dashboardSessionFileSizeLabel === 'function'
+      ? window.__dashboardSessionFileSizeLabel(s)
+      : '';
+    const fileSizeTooltip = typeof window.__dashboardSessionFileSizeTooltip === 'function'
+      ? window.__dashboardSessionFileSizeTooltip(s)
+      : '';
+    const fileSizeBadge = fileSizeLabel
+      ? `<span class="session-file-badge" title="${escapeHtml(fileSizeTooltip || fileSizeLabel)}">${escapeHtml(fileSizeLabel)}</span>`
+      : '';
+    const contextInfo = typeof window.__dashboardSessionContextInfo === 'function'
+      ? window.__dashboardSessionContextInfo(s)
+      : null;
+    const contextTooltip = typeof window.__dashboardBuildSessionContextTooltip === 'function'
+      ? window.__dashboardBuildSessionContextTooltip(s)
+      : '';
+    const contextBar = contextInfo
+      ? `<div class="session-context-bar" title="${escapeHtml(contextTooltip)}"><span class="session-context-bar-fill" style="width:${Math.max(2, contextInfo.percent)}%"></span></div>`
+      : '';
     const claudeConfigBadge = s.source === 'claude' && s.claudeProfileLabel
       ? `<span class="session-config-badge" title="${escapeHtml(s.claudeConfigSource || '')}${s.claudeProfileHint ? `: ${escapeHtml(s.claudeProfileHint)}` : ''}">${escapeHtml(s.claudeProfileLabel)}</span>`
       : '';
 
     return `
-      <div class="session-item${isActive ? ' active' : ''}${isBusy ? ' is-busy' : ''}" data-id="${escapeHtml(s.sessionId)}">
+      <div class="session-item${isActive ? ' active' : ''}${isBusy ? ' is-busy' : ''}${isUnread ? ' is-unread' : ''}${isArchived ? ' is-archived' : ''}" data-id="${escapeHtml(s.sessionId)}">
         <button class="session-pin-btn${pinClass}" data-pin-id="${escapeHtml(s.sessionId)}" title="${pinLabel} session">${pinLabel}</button>
         <button class="session-delete-btn" data-delete-id="${escapeHtml(s.sessionId)}" title="Delete session">Delete</button>
-        <div class="session-prompt" title="${escapeHtml(s.firstPrompt || '')}">${prompt}</div>
+        <div class="session-prompt" title="${escapeHtml(titleTooltip)}">${prompt}</div>
         <div class="session-meta">
           <span class="session-source-badge source-${sourceClass}" title="${escapeHtml(s.sourceLabel || s.source || '')}">${sourceLabel}</span>
+          ${forkBadge}
+          ${fileSizeBadge}
           ${claudeConfigBadge}
+          ${cacheBadge}
+          ${archivedBadge}
           ${liveBadge}
+          ${isUnread ? '<span class="session-unread-badge">NEW</span>' : ''}
           ${draftBadge}
           <span class="session-date">${date}</span>
           <span class="session-msg-count">${s.messageCount} msgs</span>
           ${branch ? `<span class="session-branch" title="${branch}">${branch}</span>` : ''}
         </div>
         ${summary ? `<div class="session-summary" title="${escapeHtml(s.summary)}">${summary}</div>` : ''}
+        ${contextBar}
       </div>
     `;
   }).join('');

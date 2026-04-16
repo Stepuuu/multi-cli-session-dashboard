@@ -1,5 +1,6 @@
 config.json
 node_modules/
+runtime/
 *.log
 .DS_Store
 data/session-title-overrides.json

@@ -4,10 +4,12 @@
   "claudeProjectsDir": "/home/your-user/.claude/projects",
   "claudeModelsFile": "/home/your-user/.models.json",
   "codexSessionsDir": "/home/your-user/.codex/sessions",
+  "codexStateDbPath": "",
   "copilotSessionStateDir": "/home/your-user/.copilot/session-state",
   "codexBin": "codex",
   "claudeBin": "claude",
   "copilotBin": "copilot",
   "copilotConfigDir": "/home/your-user/.copilot",
-  "copilotConfigFile": "/home/your-user/.copilot/config.json"
+  "copilotConfigFile": "/home/your-user/.copilot/config.json",
+  "vscodeExtensionsDir": "/home/your-user/.vscode-server/extensions"
 }

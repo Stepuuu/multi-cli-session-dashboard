@@ -36,6 +36,8 @@ export function loadRuntimeConfig(argv = process.argv.slice(2)) {
     copilotBin: 'copilot',
     copilotConfigDir: path.join(home, '.copilot'),
     copilotConfigFile: path.join(home, '.copilot', 'config.json'),
+    vscodeExtensionsDir: path.join(home, '.vscode-server', 'extensions'),
+    codexStateDbPath: '',
     configPath: defaultConfigPath,
     ...fileConfig,
   };
@@ -62,6 +64,10 @@ export function loadRuntimeConfig(argv = process.argv.slice(2)) {
       config.copilotConfigDir = argv[++i];
     } else if (argv[i] === '--copilot-config-file' && argv[i + 1]) {
       config.copilotConfigFile = argv[++i];
+    } else if (argv[i] === '--vscode-extensions-dir' && argv[i + 1]) {
+      config.vscodeExtensionsDir = argv[++i];
+    } else if (argv[i] === '--codex-state-db' && argv[i + 1]) {
+      config.codexStateDbPath = argv[++i];
     } else if (argv[i] === '--port' && argv[i + 1]) {
       config.port = parseInt(argv[++i], 10);
     }
@@ -79,6 +85,8 @@ export function loadRuntimeConfig(argv = process.argv.slice(2)) {
     COPILOT_BIN: 'copilotBin',
     COPILOT_CONFIG_DIR: 'copilotConfigDir',
     COPILOT_CONFIG_FILE: 'copilotConfigFile',
+    VSCODE_EXTENSIONS_DIR: 'vscodeExtensionsDir',
+    CODEX_STATE_DB_PATH: 'codexStateDbPath',
   };
 
   for (const [envKey, configKey] of Object.entries(envMap)) {
