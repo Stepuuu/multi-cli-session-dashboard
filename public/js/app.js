@@ -18,7 +18,6 @@ const DASHBOARD_SEEN_PROJECTS_KEY = 'session-dashboard-seen-projects-v1';
 let projectList = [];
 let sessionList = [];
 let totalMessages = 0;
-let isLoading = false;
 let hasMoreOlder = false;
 let backendHealthy = true;
 let backendRecoveryRefreshInFlight = false;
@@ -45,6 +44,13 @@ let seenProjectLatest = {};
 const unreadSessionOverrides = new Set();
 let pendingSelectedTransientRenderHandle = 0;
 let pendingSelectedTransientRender = null;
+let lastRenderedChatSignature = '';
+let lastRenderedChatSessionId = '';
+let projectLoadRequestSeq = 0;
+let activeProjectLoadToken = 0;
+let messageLoadRequestSeq = 0;
+const latestFreshMessageLoadTokenBySession = new Map();
+const inFlightMessageLoadTokenByKey = new Map();
 
 function buildProjectDigestSignature(projects) {
   return JSON.stringify((projects || []).map((project) => ([
@@ -714,6 +720,7 @@ function renderWorkspaceStrip() {
         sessionList = cachedSessions.slice();
         renderProjectSidebar();
         renderChatHeader(null);
+        invalidateRenderedChat('');
         document.getElementById('chat-messages').innerHTML = '<div class="loading">Loading session...</div>';
         notifySessionSelection();
         renderSessionActions();
@@ -756,10 +763,97 @@ function currentSessionHasActiveDashboardInteraction() {
   return !!(selectedSession && activeInteractionSessions.has(selectedSession));
 }
 
+function serializeRenderComparable(value) {
+  try {
+    return JSON.stringify(value);
+  } catch {
+    return String(value);
+  }
+}
+
+function buildChatRenderSignature(sessionId = selectedSession) {
+  return serializeRenderComparable({
+    sessionId: sessionId || '',
+    hasMoreOlder: !!hasMoreOlder,
+    totalMessages: Number(totalMessages || 0),
+    messages: currentMessageList(),
+  });
+}
+
+function invalidateRenderedChat(sessionId = selectedSession) {
+  lastRenderedChatSignature = '';
+  lastRenderedChatSessionId = sessionId || '';
+}
+
+function nextProjectLoadToken() {
+  projectLoadRequestSeq += 1;
+  activeProjectLoadToken = projectLoadRequestSeq;
+  return activeProjectLoadToken;
+}
+
+function isActiveProjectLoadToken(token) {
+  return token === activeProjectLoadToken;
+}
+
+function nextMessageLoadToken() {
+  messageLoadRequestSeq += 1;
+  return messageLoadRequestSeq;
+}
+
+function buildMessageLoadKey(projectDir, sessionId, loadOlder) {
+  return `${projectDir || ''}::${sessionId || ''}::${loadOlder ? 'older' : 'fresh'}`;
+}
+
+function beginMessageLoad(projectDir, sessionId, loadOlder) {
+  const key = buildMessageLoadKey(projectDir, sessionId, loadOlder);
+  if (inFlightMessageLoadTokenByKey.has(key)) return null;
+  const token = nextMessageLoadToken();
+  inFlightMessageLoadTokenByKey.set(key, token);
+  if (!loadOlder) {
+    latestFreshMessageLoadTokenBySession.set(sessionId, token);
+  }
+  return { key, token, projectDir, sessionId, loadOlder: !!loadOlder };
+}
+
+function finishMessageLoad(request) {
+  if (!request?.key) return;
+  if (inFlightMessageLoadTokenByKey.get(request.key) === request.token) {
+    inFlightMessageLoadTokenByKey.delete(request.key);
+  }
+}
+
+function hasPendingFreshMessageLoad(projectDir = selectedProject, sessionId = selectedSession) {
+  if (!projectDir || !sessionId) return false;
+  return inFlightMessageLoadTokenByKey.has(buildMessageLoadKey(projectDir, sessionId, false));
+}
+
+function isStaleFreshMessageLoad(request) {
+  if (!request || request.loadOlder) return false;
+  return latestFreshMessageLoadTokenBySession.get(request.sessionId) !== request.token
+    || selectedProject !== request.projectDir
+    || selectedSession !== request.sessionId;
+}
+
+function isStaleMessageLoad(request) {
+  if (!request) return true;
+  if (request.loadOlder) {
+    return selectedProject !== request.projectDir || selectedSession !== request.sessionId;
+  }
+  return isStaleFreshMessageLoad(request);
+}
+
 function renderCurrentChat(options = {}) {
   const container = chatContainer();
   const preserveScroll = options.preserveScroll !== false && !!(container && selectedSession && !shouldAutoFollowSession(selectedSession));
   const previousScrollTop = preserveScroll ? container.scrollTop : 0;
+  const renderSignature = buildChatRenderSignature(selectedSession);
+
+  if (selectedSession === lastRenderedChatSessionId && renderSignature === lastRenderedChatSignature) {
+    return;
+  }
+
+  lastRenderedChatSessionId = selectedSession || '';
+  lastRenderedChatSignature = renderSignature;
 
   renderMessages(currentMessageList(), false);
   renderLoadMoreButton(hasMoreOlder);
@@ -882,11 +976,15 @@ function dropTransientMessagesForSession(sessionId, options = {}) {
 
 function setTransientMessagesForSession(sessionId, nextMessages) {
   if (!sessionId) return;
+  const current = transientMessagesBySession.get(sessionId) || [];
   const followBeforeRender = sessionId === selectedSession
     ? (shouldAutoFollowSession(sessionId) || isChatNearBottom())
     : shouldAutoFollowSession(sessionId);
   setSessionAutoFollow(sessionId, followBeforeRender);
   const normalized = Array.isArray(nextMessages) ? nextMessages.slice() : [];
+  if (serializeRenderComparable(current) === serializeRenderComparable(normalized)) {
+    return;
+  }
   if (normalized.length > 0) {
     transientMessagesBySession.set(sessionId, normalized);
     if (sessionId !== selectedSession) {
@@ -906,6 +1004,8 @@ function setTransientMessagesForSession(sessionId, nextMessages) {
 
 function clearTransientMessagesForSession(sessionId) {
   if (!sessionId) return;
+  const hadTransient = transientMessagesBySession.has(sessionId);
+  if (!hadTransient) return;
   const followBeforeRender = sessionId === selectedSession
     ? (shouldAutoFollowSession(sessionId) || isChatNearBottom())
     : shouldAutoFollowSession(sessionId);
@@ -961,27 +1061,30 @@ async function reloadSessionsAndSelect(projectDir, matcher) {
 }
 
 async function refreshCurrentProjectSessionsSilently() {
-  if (!selectedProject) return;
-  const priorDrafts = currentDraftSessions(selectedProject).slice();
-  const digest = await fetchJSON(`/api/sessions-digest/${encodeURIComponent(selectedProject)}`);
+  const projectDir = selectedProject;
+  if (!projectDir) return;
+  const priorDrafts = currentDraftSessions(projectDir).slice();
+  const digest = await fetchJSON(`/api/sessions-digest/${encodeURIComponent(projectDir)}`);
   if (!digest) return false;
+  if (selectedProject !== projectDir) return false;
 
   const nextDigestSignature = buildSessionDigestSignature(digest);
-  const previousDigestSignature = sessionDigestSignatureByProject.get(selectedProject) || '';
+  const previousDigestSignature = sessionDigestSignatureByProject.get(projectDir) || '';
   if (nextDigestSignature === previousDigestSignature) {
     return false;
   }
 
-  const data = await fetchJSON(`/api/sessions/${encodeURIComponent(selectedProject)}`);
+  const data = await fetchJSON(`/api/sessions/${encodeURIComponent(projectDir)}`);
   if (!data) return false;
+  if (selectedProject !== projectDir) return false;
 
   const previousSelected = selectedSession;
   sessionList = data;
-  updateSessionDigestCache(selectedProject, sessionList);
-  reconcileDraftSessionsForProject(selectedProject, sessionList);
+  updateSessionDigestCache(projectDir, sessionList);
+  reconcileDraftSessionsForProject(projectDir, sessionList);
   renderSessionActions();
   renderDisplayedSessionList();
-  scheduleDraftMigration(selectedProject, sessionList, priorDrafts);
+  scheduleDraftMigration(projectDir, sessionList, priorDrafts);
 
   if (previousSelected) {
     const nextMeta = findSessionMetaById(previousSelected);
@@ -1647,6 +1750,7 @@ function selectSessionById(sessionId, options = {}) {
     if ((transientMessagesBySession.get(selectedSession) || []).length > 0) {
       renderCurrentChat();
     } else {
+      invalidateRenderedChat(selectedSession);
       document.getElementById('chat-messages').innerHTML = '<div class="empty-state">New session ready. Send a message to create it.</div>';
     }
     return;
@@ -1698,6 +1802,7 @@ async function deleteSessionById(sessionId) {
       selectedSession = null;
       sessionMeta = null;
       messages = [];
+      invalidateRenderedChat('');
       document.getElementById('chat-messages').innerHTML = '<div class="empty-state">Session deleted.</div>';
       renderChatHeader(null);
       persistDashboardState();
@@ -1721,6 +1826,7 @@ async function deleteSessionById(sessionId) {
     transientMessagesBySession.delete(sessionId);
     sessionStateCacheBySession.delete(sessionId);
     renderChatHeader(null);
+    invalidateRenderedChat('');
     document.getElementById('chat-messages').innerHTML = '<div class="empty-state">Session moved to trash.</div>';
     persistDashboardState();
     notifySessionSelection();
@@ -1769,6 +1875,7 @@ async function refreshProjectsSilently() {
 }
 
 async function loadSessions(projectDir, matcher = null) {
+  const requestToken = nextProjectLoadToken();
   const priorDrafts = currentDraftSessions(projectDir).slice();
   cacheSessionState();
   selectedProject = projectDir;
@@ -1781,6 +1888,7 @@ async function loadSessions(projectDir, matcher = null) {
 
   renderProjectSidebar();
   renderChatHeader(null);
+  invalidateRenderedChat('');
   document.getElementById('chat-messages').innerHTML = '<div class="empty-state">Select a session to view conversation</div>';
   notifySessionSelection();
   renderSessionActions();
@@ -1790,7 +1898,13 @@ async function loadSessions(projectDir, matcher = null) {
 
   const data = await fetchJSON(`/api/sessions/${encodeURIComponent(projectDir)}`);
   if (!data) {
+    if (!isActiveProjectLoadToken(requestToken) || selectedProject !== projectDir) {
+      return;
+    }
     container.innerHTML = '<div class="empty-state">Failed to load sessions</div>';
+    return;
+  }
+  if (!isActiveProjectLoadToken(requestToken) || selectedProject !== projectDir) {
     return;
   }
 
@@ -1811,14 +1925,14 @@ async function loadSessions(projectDir, matcher = null) {
 
   if (matcher) {
     const matched = matchSessionByMatcher(allSessionsForProject(projectDir), matcher);
-    if (matched) {
+    if (matched && isActiveProjectLoadToken(requestToken) && selectedProject === projectDir) {
       selectSessionById(matched.sessionId, { skipFetch: matched.isDraft });
       return;
     }
   }
 
   const fallback = defaultSessionForProject(projectDir);
-  if (fallback) {
+  if (fallback && isActiveProjectLoadToken(requestToken) && selectedProject === projectDir) {
     selectSessionById(fallback.sessionId, { skipFetch: fallback.isDraft });
   }
 }
@@ -1879,7 +1993,7 @@ async function pollSelectedSessionUpdates() {
     renderWorkspaceStrip();
     persistDashboardState();
 
-    if (changed && !isLoading) {
+    if (changed && !hasPendingFreshMessageLoad(selectedProject, selectedSession)) {
       await loadMessages(selectedProject, selectedSession, false);
     }
   } finally {
@@ -1888,11 +2002,12 @@ async function pollSelectedSessionUpdates() {
 }
 
 async function loadMessages(projectDir, sessionId, loadOlder, options = {}) {
-  if (isLoading) return;
-  isLoading = true;
+  const request = beginMessageLoad(projectDir, sessionId, loadOlder);
+  if (!request) return;
   const followBeforeRender = shouldAutoFollowSession(sessionId);
   const preserveVisibleMessages = !loadOlder && !!options.preserveVisibleMessages && selectedSession === sessionId && messages.length > 0;
   const clearTransientOnSuccess = !loadOlder && !!options.clearTransientOnSuccess;
+  const requestOffset = loadOlder ? offset : 0;
 
   if (!loadOlder) {
     // Fresh load — get latest messages
@@ -1900,6 +2015,7 @@ async function loadMessages(projectDir, sessionId, loadOlder, options = {}) {
     offset = 0;
     if (!preserveVisibleMessages) {
       messages = [];
+      invalidateRenderedChat(sessionId);
       document.getElementById('chat-messages').innerHTML = '<div class="loading">Loading messages...</div>';
     }
 
@@ -1910,15 +2026,26 @@ async function loadMessages(projectDir, sessionId, loadOlder, options = {}) {
   }
 
   // direction=newest: offset=0 gets the last PAGE_SIZE messages
-  const url = `/api/messages/${encodeURIComponent(projectDir)}/${encodeURIComponent(sessionId)}?offset=${offset}&limit=${PAGE_SIZE}&direction=newest`;
-  const data = await fetchJSON(url);
-
-  isLoading = false;
+  const url = `/api/messages/${encodeURIComponent(projectDir)}/${encodeURIComponent(sessionId)}?offset=${requestOffset}&limit=${PAGE_SIZE}&direction=newest`;
+  let data = null;
+  try {
+    data = await fetchJSON(url);
+  } finally {
+    finishMessageLoad(request);
+  }
 
   if (!data) {
+    if (isStaleMessageLoad(request)) {
+      return;
+    }
     if (!loadOlder && !preserveVisibleMessages) {
+      invalidateRenderedChat(sessionId);
       document.getElementById('chat-messages').innerHTML = '<div class="empty-state">Failed to load messages</div>';
     }
+    return;
+  }
+
+  if (isStaleMessageLoad(request)) {
     return;
   }
 
@@ -1934,6 +2061,7 @@ async function loadMessages(projectDir, sessionId, loadOlder, options = {}) {
     renderCurrentChat({ preserveScroll: false });
     // Maintain scroll position after prepending
     chatContainer.scrollTop = prevScrollTop + (chatContainer.scrollHeight - prevScrollHeight);
+    offset = requestOffset + (data.messages || []).length;
   } else {
     if (clearTransientOnSuccess) {
       dropTransientMessagesForSession(sessionId, { clearUnread: sessionId === selectedSession });
@@ -1946,6 +2074,7 @@ async function loadMessages(projectDir, sessionId, loadOlder, options = {}) {
     if (selectedSession === sessionId && sessionMeta) {
       markSessionSeen(sessionId, sessionMeta, projectDir);
     }
+    offset = (data.messages || []).length;
   }
 
   cacheSessionState(sessionId, sessionMeta);
@@ -1958,8 +2087,6 @@ async function loadMessages(projectDir, sessionId, loadOlder, options = {}) {
       renderChatHeader(sessionMeta);
     }
   }
-
-  offset += (data.messages || []).length;
 }
 
 function loadMoreMessages() {

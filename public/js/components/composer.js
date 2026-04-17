@@ -9,12 +9,16 @@ let composerSelection = { project: null, session: null, sessionMeta: null };
 let composerTransientCounter = 0;
 const COMPOSER_MAX_HEIGHT = 260;
 const COMPOSER_CLAUDE_PROFILE_TTL_MS = 15000;
+const COMPOSER_SUBAGENT_POLL_INTERVAL_MS = 2000;
+const COMPOSER_SUBAGENT_TAIL = 20;
+const COMPOSER_SUBAGENT_INTERACTION_LOOKBACK_MS = 15000;
 
 const composerSendingSessions = new Set();
 const composerStatusBySession = new Map();
 const composerTransientMessagesBySession = new Map();
 const composerImageStateBySession = new Map();
 const composerControllersBySession = new Map();
+const composerSubagentPollersBySession = new Map();
 const composerClaudeProfileOverrideBySession = new Map();
 const composerLatestInteractionTokenBySession = new Map();
 const composerActivityEntriesBySession = new Map();
@@ -298,6 +302,14 @@ function resetTransientTimelineForSession(sessionId) {
   }
 }
 
+function composerSerializeComparable(value) {
+  try {
+    return JSON.stringify(value);
+  } catch {
+    return String(value);
+  }
+}
+
 function nextTransientId() {
   composerTransientCounter += 1;
   return `composer-tmp-${composerTransientCounter}`;
@@ -334,9 +346,18 @@ function pushTransientMessageForSession(sessionId, sessionMeta, message) {
 }
 
 function updateTransientMessageForSession(sessionId, id, patch) {
-  const next = getTransientMessages(sessionId).map((msg) => (
-    msg._transientId === id ? { ...msg, ...patch } : msg
-  ));
+  const current = getTransientMessages(sessionId);
+  let changed = false;
+  const next = current.map((msg) => {
+    if (msg._transientId !== id) return msg;
+    const updated = { ...msg, ...patch };
+    if (composerSerializeComparable(updated) !== composerSerializeComparable(msg)) {
+      changed = true;
+      return updated;
+    }
+    return msg;
+  });
+  if (!changed) return;
   composerTransientMessagesBySession.set(sessionId, next);
   syncTransientTimelineForSession(sessionId);
 }
@@ -379,13 +400,176 @@ function finalizeLiveMessages(sessionId) {
 }
 
 function appendTransientEventMessage(sessionId, sessionMeta, type, content) {
-  if (!content) return '';
+  let payload;
+  if (type && typeof type === 'object') {
+    payload = { ...type };
+  } else {
+    payload = {
+      type,
+      content,
+    };
+  }
+  const messageType = payload.type || 'status';
+  const body = payload.content || payload.message || '';
+  if (!body && !payload.toolName && !payload.command && !(Array.isArray(payload.changes) && payload.changes.length)) {
+    return '';
+  }
+  delete payload.message;
   return pushTransientMessageForSession(sessionId, sessionMeta, {
-    type,
-    content,
+    ...payload,
+    type: messageType,
+    content: body,
     live: false,
     pending: false,
   });
+}
+
+function dropTransientSubagentGroups(sessionId) {
+  if (!sessionId) return;
+  const current = getTransientMessages(sessionId);
+  const next = current.filter((msg) => (
+    msg.type !== 'subagent_group'
+    && !(typeof msg._transientKind === 'string' && msg._transientKind.startsWith('subagent-group:'))
+  ));
+  if (next.length === current.length) return;
+  if (next.length > 0) {
+    composerTransientMessagesBySession.set(sessionId, next);
+  } else {
+    composerTransientMessagesBySession.delete(sessionId);
+  }
+  syncTransientTimelineForSession(sessionId);
+}
+
+function stopSubagentPolling(sessionId) {
+  const poller = composerSubagentPollersBySession.get(sessionId);
+  if (!poller) return;
+  poller.stopped = true;
+  if (poller.timer) clearTimeout(poller.timer);
+  if (poller.controller) poller.controller.abort();
+  composerSubagentPollersBySession.delete(sessionId);
+}
+
+function parseComposerTimestampMs(value) {
+  if (!value) return Number.NaN;
+  const date = new Date(value);
+  const ms = date.getTime();
+  return Number.isFinite(ms) ? ms : Number.NaN;
+}
+
+function isTerminalComposerSubagentStatus(status) {
+  const normalized = String(status || '').toLowerCase();
+  return normalized === 'completed'
+    || normalized === 'aborted'
+    || normalized === 'failed'
+    || normalized === 'error'
+    || normalized === 'stale';
+}
+
+function shouldIncludePolledSubagentGroup(group, poller) {
+  const rawSessionId = group?.subagent?.rawSessionId || '';
+  if (!rawSessionId || !poller) return false;
+  if (poller.seenSubagentIds?.has(rawSessionId)) return true;
+
+  const interactionStartMs = Number(poller.interactionStartMs || 0);
+  const cutoffMs = interactionStartMs > 0
+    ? interactionStartMs - COMPOSER_SUBAGENT_INTERACTION_LOOKBACK_MS
+    : Number.NEGATIVE_INFINITY;
+  const startedMs = parseComposerTimestampMs(group?.subagent?.startedAt || group?.timestamp || '');
+  const completedMs = parseComposerTimestampMs(group?.subagent?.completedAt || '');
+  const newestMs = Math.max(
+    Number.isFinite(startedMs) ? startedMs : Number.NEGATIVE_INFINITY,
+    Number.isFinite(completedMs) ? completedMs : Number.NEGATIVE_INFINITY,
+  );
+  const status = group?.subagent?.status || '';
+
+  const isRecent = Number.isFinite(newestMs) && newestMs >= cutoffMs;
+  if (isRecent) {
+    poller.seenSubagentIds.add(rawSessionId);
+    return true;
+  }
+
+  if (!isTerminalComposerSubagentStatus(status) && Number.isFinite(startedMs) && startedMs >= cutoffMs) {
+    poller.seenSubagentIds.add(rawSessionId);
+    return true;
+  }
+
+  return false;
+}
+
+function upsertTransientSubagentGroup(sessionId, sessionMeta, group) {
+  if (!group?.subagent?.rawSessionId) return '';
+  const kind = `subagent-group:${group.subagent.rawSessionId}`;
+  const patch = {
+    ...group,
+    type: 'subagent_group',
+    live: group.subagent?.status !== 'completed',
+    pending: group.subagent?.status !== 'completed',
+    _transientKind: kind,
+  };
+  const existing = getTransientMessages(sessionId).find((msg) => msg._transientKind === kind);
+  if (existing) {
+    updateTransientMessageForSession(sessionId, existing._transientId, patch);
+    return existing._transientId;
+  }
+  return pushTransientMessageForSession(sessionId, sessionMeta, patch);
+}
+
+async function pollSubagentGroups(sessionId, projectToken, sessionToken, sessionMeta, interactionToken) {
+  const poller = composerSubagentPollersBySession.get(sessionId);
+  if (!poller || poller.stopped) return;
+  if (composerLatestInteractionTokenBySession.get(sessionId) !== interactionToken) {
+    stopSubagentPolling(sessionId);
+    return;
+  }
+
+  poller.pollCount = (poller.pollCount || 0) + 1;
+  const fresh = poller.pollCount % 3 === 1 ? '1' : '0';
+  const url = `/api/subagent-groups/${encodeURIComponent(projectToken)}/${encodeURIComponent(sessionToken)}?tail=${COMPOSER_SUBAGENT_TAIL}&fresh=${fresh}`;
+  const controller = new AbortController();
+  poller.controller = controller;
+
+  try {
+    const response = await composerFetch(url, { signal: controller.signal });
+    if (!response.ok) {
+      throw new Error(`HTTP ${response.status}`);
+    }
+    const payload = await response.json();
+    const groups = (Array.isArray(payload?.groups) ? payload.groups : []).filter((group) => (
+      shouldIncludePolledSubagentGroup(group, poller)
+    ));
+    for (const group of groups) {
+      upsertTransientSubagentGroup(sessionId, sessionMeta, group);
+    }
+  } catch (err) {
+    if (poller.stopped || controller.signal.aborted) return;
+    console.error('Subagent poll failed', err);
+  } finally {
+    if (poller.controller === controller) {
+      poller.controller = null;
+    }
+  }
+
+  if (poller.stopped) return;
+  poller.timer = setTimeout(() => {
+    pollSubagentGroups(sessionId, projectToken, sessionToken, sessionMeta, interactionToken);
+  }, COMPOSER_SUBAGENT_POLL_INTERVAL_MS);
+}
+
+function startSubagentPolling(sessionId, projectToken, sessionToken, sessionMeta, interactionToken) {
+  if (!sessionId || !projectToken || !sessionToken || sessionMeta?.source !== 'codex' || sessionMeta?.isDraft) {
+    return;
+  }
+  stopSubagentPolling(sessionId);
+  dropTransientSubagentGroups(sessionId);
+  composerSubagentPollersBySession.set(sessionId, {
+    stopped: false,
+    timer: null,
+    controller: null,
+    pollCount: 0,
+    interactionStartMs: Date.now(),
+    seenSubagentIds: new Set(),
+  });
+  pollSubagentGroups(sessionId, projectToken, sessionToken, sessionMeta, interactionToken);
 }
 
 function resetComposerAttachments() {
@@ -588,14 +772,22 @@ function buildStreamEventHandler(sessionId, sessionMeta, requestState, projectTo
     if (event.type === 'tool_event') {
       setComposerStatusForSession(sessionId, event.message || 'Tool running...', false);
       pushComposerActivityEntry(sessionId, 'tool', event.message || 'Tool running...');
-      appendTransientEventMessage(sessionId, sessionMeta, 'tool_event', event.message || 'Tool running...');
+      appendTransientEventMessage(sessionId, sessionMeta, {
+        ...event,
+        type: 'tool_event',
+        content: event.content || event.message || 'Tool running...',
+      });
       return;
     }
 
     if (event.type === 'tool_result') {
       setComposerStatusForSession(sessionId, 'Tool completed.', false);
       pushComposerActivityEntry(sessionId, 'result', event.message || 'Tool completed.');
-      appendTransientEventMessage(sessionId, sessionMeta, 'tool_result', event.message || 'Tool completed.');
+      appendTransientEventMessage(sessionId, sessionMeta, {
+        ...event,
+        type: 'tool_result',
+        content: event.content || event.message || 'Tool completed.',
+      });
       return;
     }
 
@@ -649,6 +841,7 @@ function buildStreamEventHandler(sessionId, sessionMeta, requestState, projectTo
     }
 
     if (event.type === 'error') {
+      stopSubagentPolling(sessionId);
       const message = normalizeComposerErrorMessage(event.message || 'Interaction failed.');
       setComposerStatusForSession(sessionId, message, true);
       pushComposerActivityEntry(sessionId, 'error', `Error: ${message}`);
@@ -657,6 +850,7 @@ function buildStreamEventHandler(sessionId, sessionMeta, requestState, projectTo
     }
 
     if (event.type === 'done') {
+      stopSubagentPolling(sessionId);
       finalizeLiveMessages(sessionId);
       pushComposerActivityEntry(sessionId, 'status', 'Turn completed.');
       setComposerStatusForSession(sessionId, 'Done', false);
@@ -673,6 +867,7 @@ function stopComposerForSession(sessionId, options = {}) {
   const controller = composerControllersBySession.get(sessionId);
   if (!controller) return false;
 
+  stopSubagentPolling(sessionId);
   composerControllersBySession.delete(sessionId);
   composerSendingSessions.delete(sessionId);
   if (typeof window.__dashboardSetSessionActivityState === 'function') {
@@ -752,6 +947,7 @@ async function submitInteraction({
     const handleEvent = buildStreamEventHandler(sessionId, sessionMeta, requestState, projectToken);
     const controller = new AbortController();
     composerControllersBySession.set(sessionId, controller);
+    startSubagentPolling(sessionId, projectToken, sessionToken, sessionMeta, interactionToken);
     const response = await composerFetch(
       `/api/interact/${encodeURIComponent(projectToken)}/${encodeURIComponent(sessionToken)}`,
       {
@@ -790,6 +986,7 @@ async function submitInteraction({
       finalizeComposerHydration(projectToken, sessionId, requestState, interactionToken);
     }, 800);
   } catch (err) {
+    stopSubagentPolling(sessionId);
     if (err.name === 'AbortError') {
       await finalizeComposerHydration(projectToken, sessionId, requestState, interactionToken);
       return;
@@ -804,6 +1001,7 @@ async function submitInteraction({
       finalizeComposerHydration(projectToken, sessionId, requestState, interactionToken);
     }, 600);
   } finally {
+    stopSubagentPolling(sessionId);
     composerControllersBySession.delete(sessionId);
     composerSendingSessions.delete(sessionId);
     if (typeof window.__dashboardSetSessionActivityState === 'function') {

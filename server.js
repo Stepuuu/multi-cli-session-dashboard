@@ -280,6 +280,173 @@ function buildSessionDigest(sessions) {
   }));
 }
 
+function buildCodexSubagentParentKey(projectPath, parentThreadId) {
+  return JSON.stringify({
+    projectPath: normalizeProjectPath(projectPath || ''),
+    parentThreadId: parentThreadId || '',
+  });
+}
+
+function compareTimestampedItems(left, right) {
+  const leftTime = left?.timestamp ? new Date(left.timestamp).getTime() : Number.NaN;
+  const rightTime = right?.timestamp ? new Date(right.timestamp).getTime() : Number.NaN;
+  const leftHasTime = Number.isFinite(leftTime);
+  const rightHasTime = Number.isFinite(rightTime);
+
+  if (leftHasTime && rightHasTime && leftTime !== rightTime) {
+    return leftTime - rightTime;
+  }
+  if (leftHasTime !== rightHasTime) {
+    return leftHasTime ? -1 : 1;
+  }
+
+  const leftOrder = Number.isFinite(left?._mergeOrder) ? left._mergeOrder : 0;
+  const rightOrder = Number.isFinite(right?._mergeOrder) ? right._mergeOrder : 0;
+  return leftOrder - rightOrder;
+}
+
+function compactStructuredValue(value, depth = 0) {
+  if (value == null) return value;
+  if (typeof value === 'string') return truncateText(value, 400);
+  if (typeof value === 'number' || typeof value === 'boolean') return value;
+  if (depth >= 3) return truncateText(normalizeText(value), 400);
+
+  if (Array.isArray(value)) {
+    return value.slice(0, 8).map((item) => compactStructuredValue(item, depth + 1));
+  }
+
+  if (typeof value === 'object') {
+    const result = {};
+    for (const [key, entry] of Object.entries(value).slice(0, 12)) {
+      result[key] = compactStructuredValue(entry, depth + 1);
+    }
+    return result;
+  }
+
+  return truncateText(normalizeText(value), 400);
+}
+
+function maybeParseJsonString(value) {
+  if (typeof value !== 'string') return value;
+  const trimmed = value.trim();
+  if (!trimmed) return value;
+  if (!/^[{\[]/.test(trimmed)) return value;
+  const parsed = safeJsonParse(trimmed);
+  return parsed == null ? value : parsed;
+}
+
+function normalizeToolPayload(value) {
+  if (typeof value === 'string') {
+    return maybeParseJsonString(value);
+  }
+  return value;
+}
+
+function summarizeToolPayload(toolName, value) {
+  const normalized = normalizeToolPayload(value);
+  if (typeof normalized === 'string') {
+    return truncateText(normalized.split('\n').find(Boolean) || normalized, 160);
+  }
+
+  if (Array.isArray(normalized)) {
+    return `${normalized.length} item${normalized.length === 1 ? '' : 's'}`;
+  }
+
+  if (normalized && typeof normalized === 'object') {
+    const candidates = [
+      normalized.command,
+      normalized.cmd,
+      normalized.query,
+      normalized.pattern,
+      normalized.path,
+      normalized.file_path,
+      normalized.filePath,
+      normalized.description,
+      normalized.prompt,
+      normalized.subject,
+      normalized.taskId ? `task ${normalized.taskId}` : '',
+      normalized.owner ? `owner ${normalized.owner}` : '',
+      normalized.status ? `status ${normalized.status}` : '',
+    ].filter(Boolean);
+    if (candidates.length > 0) {
+      return truncateText(String(candidates[0]), 160);
+    }
+
+    const keys = Object.keys(normalized);
+    if (keys.length) {
+      return truncateText(`${toolName || 'tool'} · ${keys.slice(0, 4).join(', ')}`, 160);
+    }
+  }
+
+  return truncateText(normalizeText(normalized), 160);
+}
+
+function summarizeStructuredToolResult(value) {
+  if (!value || typeof value !== 'object') return '';
+
+  if (value.status === 'teammate_spawned' && (value.name || value.agent_id || value.teammate_id)) {
+    return `Spawned ${value.name || value.agent_id || value.teammate_id}`;
+  }
+  if (value.task?.id && value.task?.subject) {
+    return `Task #${value.task.id}: ${value.task.subject}`;
+  }
+  if (value.taskId && value.updatedFields) {
+    const fields = Array.isArray(value.updatedFields) ? value.updatedFields.join(', ') : 'updated';
+    return `Task #${value.taskId}: ${fields}`;
+  }
+  if (typeof value.success === 'boolean') {
+    return value.success ? 'Operation succeeded' : 'Operation failed';
+  }
+  if (value.agent_id || value.teammate_id) {
+    return String(value.agent_id || value.teammate_id);
+  }
+
+  const keys = Object.keys(value);
+  if (keys.length === 0) return '';
+  const preview = keys
+    .slice(0, 3)
+    .map((key) => `${key}=${truncateText(normalizeText(value[key]), 60)}`)
+    .join(' · ');
+  return truncateText(preview, 180);
+}
+
+function buildCodexTokenUsageSummary(info) {
+  const usage = info?.last_token_usage || info?.lastTokenUsage || null;
+  if (!usage) return '';
+  const inputTokens = Number(usage.input_tokens ?? usage.inputTokens ?? 0);
+  const cachedInputTokens = Number(usage.cached_input_tokens ?? usage.cachedInputTokens ?? 0);
+  const outputTokens = Number(usage.output_tokens ?? usage.outputTokens ?? 0);
+  const usedTokens = Number(usage.total_tokens ?? usage.totalTokens ?? (inputTokens + outputTokens));
+  const contextWindow = Number(info?.model_context_window ?? info?.modelContextWindow ?? 0);
+
+  const parts = [];
+  if (contextWindow > 0 && usedTokens > 0) {
+    parts.push(`Context ${usedTokens}/${contextWindow}`);
+  }
+  if (inputTokens > 0) {
+    parts.push(`Input ${inputTokens}`);
+  }
+  if (cachedInputTokens > 0) {
+    parts.push(`Cached ${cachedInputTokens}`);
+  }
+  if (outputTokens > 0) {
+    parts.push(`Output ${outputTokens}`);
+  }
+  return parts.join(' · ');
+}
+
+function nextMessageOrder(state) {
+  state._messageOrder = (state._messageOrder || 0) + 1;
+  return state._messageOrder;
+}
+
+function parseTimestampMs(value) {
+  if (!value) return Number.NaN;
+  const date = new Date(value);
+  const ms = date.getTime();
+  return Number.isFinite(ms) ? ms : Number.NaN;
+}
+
 function normalizeEpochTimestamp(value) {
   const numeric = Number(value);
   if (!Number.isFinite(numeric) || numeric <= 0) return '';
@@ -406,8 +573,6 @@ function parseClaudeModelsJson(raw) {
 }
 
 function preferredClaudeProfileForModel(model) {
-  // Override this function or configure profile-model mappings in your .models.json
-  // to automatically select a profile based on the model string.
   return '';
 }
 
@@ -1107,6 +1272,13 @@ async function scanCodexMetadata(filePath) {
     let totalOutputTokens = 0;
     let contextWindowTokens = 0;
     let forkedFromId = '';
+    let isSubagentSession = false;
+    let parentThreadId = '';
+    let agentRole = '';
+    let agentNickname = '';
+    let depth = 0;
+    let completedAt = '';
+    let durationMs = 0;
     let sawPrimarySessionMeta = false;
 
     rl.on('line', (line) => {
@@ -1118,11 +1290,31 @@ async function scanCodexMetadata(filePath) {
         // after the new thread's own session_meta. Only the first one
         // identifies the file's logical session.
         if (!sawPrimarySessionMeta) {
+          const subagentSpawn = obj.payload?.source?.subagent?.thread_spawn;
           rawSessionId = obj.payload?.id || rawSessionId;
           forkedFromId = obj.payload?.forked_from_id || forkedFromId;
           projectPath = obj.payload?.cwd || projectPath;
           created = obj.payload?.timestamp || obj.timestamp || created;
           model = obj.payload?.model || model;
+          if (subagentSpawn && typeof subagentSpawn === 'object') {
+            isSubagentSession = true;
+            parentThreadId = typeof subagentSpawn.parent_thread_id === 'string'
+              ? subagentSpawn.parent_thread_id
+              : '';
+            depth = Number.isFinite(Number(subagentSpawn.depth)) ? Number(subagentSpawn.depth) : 0;
+            agentRole = typeof subagentSpawn.agent_role === 'string'
+              ? subagentSpawn.agent_role
+              : '';
+            agentNickname = typeof subagentSpawn.agent_nickname === 'string'
+              ? subagentSpawn.agent_nickname
+              : '';
+          }
+          if (!agentRole && typeof obj.payload?.agent_role === 'string') {
+            agentRole = obj.payload.agent_role;
+          }
+          if (!agentNickname && typeof obj.payload?.agent_nickname === 'string') {
+            agentNickname = obj.payload.agent_nickname;
+          }
           sawPrimarySessionMeta = true;
         }
         return;
@@ -1138,6 +1330,15 @@ async function scanCodexMetadata(filePath) {
         const windowSize = Number(obj.payload?.model_context_window ?? obj.payload?.modelContextWindow ?? 0);
         if (Number.isFinite(windowSize) && windowSize > 0) {
           contextWindowTokens = windowSize;
+        }
+        return;
+      }
+
+      if (obj.type === 'event_msg' && obj.payload?.type === 'task_complete') {
+        completedAt = normalizeEpochTimestamp(obj.payload?.completed_at) || obj.timestamp || completedAt;
+        const duration = Number(obj.payload?.duration_ms ?? 0);
+        if (Number.isFinite(duration) && duration > 0) {
+          durationMs = duration;
         }
         return;
       }
@@ -1204,6 +1405,13 @@ async function scanCodexMetadata(filePath) {
         totalInputTokens,
         totalOutputTokens,
         contextWindowTokens,
+        isSubagentSession,
+        parentThreadId,
+        agentRole,
+        agentNickname,
+        depth,
+        completedAt,
+        durationMs,
       });
     });
     rl.on('error', reject);
@@ -1218,6 +1426,7 @@ async function collectCodexSessions() {
   const threadStateMap = await readCodexThreadStateMap();
 
   const sessions = [];
+  const hiddenSubagentSessions = [];
 
   for (const filePath of files) {
     let fileStat;
@@ -1231,18 +1440,32 @@ async function collectCodexSessions() {
     const fingerprint = buildFileFingerprint(fileStat);
     const relativePath = path.relative(config.codexSessionsDir, filePath);
     const cached = getCachedSessionMetadata(cacheKey, fingerprint);
-    if (cached) {
-      const projectPath = normalizeProjectPath(cached.projectPath);
-      const rawSessionId = cached.rawSessionId || path.basename(filePath, '.jsonl');
+    const cachedNeedsRefresh = cached && typeof cached.isSubagentSession === 'boolean' && (
+      !Object.prototype.hasOwnProperty.call(cached, 'completedAt')
+      || !Object.prototype.hasOwnProperty.call(cached, 'durationMs')
+      || !Object.prototype.hasOwnProperty.call(cached, 'parentThreadId')
+      || !Object.prototype.hasOwnProperty.call(cached, 'agentRole')
+      || !Object.prototype.hasOwnProperty.call(cached, 'agentNickname')
+      || !Object.prototype.hasOwnProperty.call(cached, 'depth')
+    );
+    if (cached && typeof cached.isSubagentSession === 'boolean' && !cachedNeedsRefresh) {
       const hydratedCached = {
         ...cached,
         source: 'codex',
         sourceLabel: SOURCE_META.codex.label,
         sourceShortLabel: SOURCE_META.codex.shortLabel,
-        projectPath,
-        projectName: displayNameFromPath(projectPath),
-        rawSessionId,
+        projectPath: normalizeProjectPath(cached.projectPath),
+        projectName: displayNameFromPath(normalizeProjectPath(cached.projectPath)),
+        rawSessionId: cached.rawSessionId || path.basename(filePath, '.jsonl'),
+        relativePath: cached.relativePath || relativePath,
         forkedFromId: cached.forkedFromId || '',
+        isSubagentSession: !!cached.isSubagentSession,
+        parentThreadId: cached.parentThreadId || '',
+        agentRole: cached.agentRole || '',
+        agentNickname: cached.agentNickname || '',
+        depth: cached.depth || 0,
+        completedAt: cached.completedAt || '',
+        durationMs: cached.durationMs || 0,
         fileSizeBytes: cached.fileSizeBytes || fileStat.size,
         lastInputTokens: cached.lastInputTokens || 0,
         lastCachedInputTokens: cached.lastCachedInputTokens || 0,
@@ -1253,12 +1476,16 @@ async function collectCodexSessions() {
         contextWindowTokens: cached.contextWindowTokens || 0,
         sessionId: encodeToken({
           source: 'codex',
-          projectPath,
+          projectPath: normalizeProjectPath(cached.projectPath),
           relativePath,
-          rawSessionId,
+          rawSessionId: cached.rawSessionId || path.basename(filePath, '.jsonl'),
         }),
       };
       setCachedSessionMetadata(cacheKey, fingerprint, hydratedCached);
+      if (cached.isSubagentSession) {
+        hiddenSubagentSessions.push(hydratedCached);
+        continue;
+      }
       sessions.push(applyCodexThreadState(hydratedCached, threadStateMap));
       continue;
     }
@@ -1273,7 +1500,15 @@ async function collectCodexSessions() {
       projectPath,
       projectName: displayNameFromPath(projectPath),
       rawSessionId: metadata.rawSessionId,
+      relativePath,
       forkedFromId: metadata.forkedFromId || '',
+      isSubagentSession: metadata.isSubagentSession || false,
+      parentThreadId: metadata.parentThreadId || '',
+      agentRole: metadata.agentRole || '',
+      agentNickname: metadata.agentNickname || '',
+      depth: metadata.depth || 0,
+      completedAt: metadata.completedAt || '',
+      durationMs: metadata.durationMs || 0,
       firstPrompt: metadata.firstPrompt,
       summary: '',
       messageCount: metadata.messageCount,
@@ -1298,10 +1533,17 @@ async function collectCodexSessions() {
     };
 
     setCachedSessionMetadata(cacheKey, fingerprint, baseSession);
+    if (baseSession.isSubagentSession) {
+      hiddenSubagentSessions.push(baseSession);
+      continue;
+    }
     sessions.push(applyCodexThreadState(baseSession, threadStateMap));
   }
 
-  return dedupeCodexSessions(sessions);
+  return {
+    sessions: dedupeCodexSessions(sessions),
+    hiddenSubagentSessions: dedupeCodexSessions(hiddenSubagentSessions),
+  };
 }
 
 function choosePreferredCodexSession(current, candidate) {
@@ -1495,24 +1737,31 @@ async function collectAllSessions() {
   await ensureClaudeProfilesLoaded();
   await ensureSessionMetadataCacheLoaded();
 
-  const [claude, codex, copilot] = await Promise.all([
+  const [claude, codexResult, copilot] = await Promise.all([
     collectClaudeSessions(),
     collectCodexSessions(),
     collectCopilotSessions(),
   ]);
 
-  return [
+  const sessions = [
     ...claude.map(decorateClaudeSessionConfig),
-    ...codex,
+    ...codexResult.sessions,
     ...copilot,
   ].map(applySessionTitleOverride);
+
+  return {
+    sessions,
+    hiddenCodexSubagentSessions: codexResult.hiddenSubagentSessions || [],
+  };
 }
 
 async function buildSessionsSnapshot() {
-  const sessions = await collectAllSessions();
+  const collected = await collectAllSessions();
+  const sessions = collected.sessions;
   const projects = buildProjectRows(sessions);
   const sessionsByProject = new Map();
   const sessionsDigestByProject = new Map();
+  const hiddenCodexSubagentsByParent = new Map();
 
   for (const project of projects) {
     const projectSessions = sessions
@@ -1526,6 +1775,25 @@ async function buildSessionsSnapshot() {
     sessionsDigestByProject.set(project.path, buildSessionDigest(projectSessions));
   }
 
+  for (const subagentSession of collected.hiddenCodexSubagentSessions || []) {
+    if (!subagentSession.parentThreadId) continue;
+    const key = buildCodexSubagentParentKey(
+      subagentSession.projectPath,
+      subagentSession.parentThreadId,
+    );
+    const existing = hiddenCodexSubagentsByParent.get(key) || [];
+    existing.push(subagentSession);
+    hiddenCodexSubagentsByParent.set(key, existing);
+  }
+
+  for (const sessionsForParent of hiddenCodexSubagentsByParent.values()) {
+    sessionsForParent.sort((left, right) => {
+      const leftTime = new Date(left.created || left.modified || 0).getTime();
+      const rightTime = new Date(right.created || right.modified || 0).getTime();
+      return leftTime - rightTime;
+    });
+  }
+
   const snapshot = {
     builtAt: Date.now(),
     sessions,
@@ -1533,6 +1801,7 @@ async function buildSessionsSnapshot() {
     projectsDigest: buildProjectDigest(projects),
     sessionsByProject,
     sessionsDigestByProject,
+    hiddenCodexSubagentsByParent,
   };
 
   sessionsSnapshotCache = snapshot;
@@ -1700,24 +1969,17 @@ function parseClaudeAssistantContent(content) {
         };
       }
       if (block.type === 'tool_use') {
-        const inputSummary = truncateText(
-          typeof block.input === 'string' ? block.input : JSON.stringify(block.input || {}),
-          1500
-        );
-        return { type: 'tool_use', name: block.name || 'unknown', input: inputSummary };
+        const normalizedInput = normalizeToolPayload(block.input);
+        return {
+          type: 'tool_use',
+          name: block.name || 'unknown',
+          tool_use_id: block.id || '',
+          summary: summarizeToolPayload(block.name || 'unknown', normalizedInput),
+          input: compactStructuredValue(normalizedInput),
+        };
       }
       if (block.type === 'tool_result') {
-        const result = Array.isArray(block.content)
-          ? block.content
-              .filter((item) => item.type === 'text')
-              .map((item) => item.text || '')
-              .join('\n')
-          : normalizeText(block.content);
-        return {
-          type: 'tool_result',
-          tool_use_id: block.tool_use_id || '',
-          content: truncateText(result, 1500),
-        };
+        return buildClaudeToolResultBlock(block);
       }
 
       const fallback = truncateText(JSON.stringify(block), 500);
@@ -1726,25 +1988,53 @@ function parseClaudeAssistantContent(content) {
     .filter(Boolean);
 }
 
-function parseClaudeToolResults(content) {
+function buildClaudeToolResultBlock(block, toolUseResult = null) {
+  const resultText = Array.isArray(block?.content)
+    ? block.content
+        .filter((item) => item.type === 'text')
+        .map((item) => item.text || '')
+        .join('\n')
+    : normalizeText(block?.content);
+  const normalizedStructured = toolUseResult && typeof toolUseResult === 'object'
+    ? compactStructuredValue(toolUseResult)
+    : null;
+  const stringStructured = typeof toolUseResult === 'string' ? normalizeText(toolUseResult) : '';
+  const summary = block?.is_error
+    ? truncateText(resultText || stringStructured || 'Tool error', 180)
+    : summarizeStructuredToolResult(toolUseResult)
+      || truncateText((resultText || stringStructured || 'Tool completed').split('\n')[0], 180);
+
+  return {
+    type: 'tool_result',
+    tool_use_id: block?.tool_use_id || '',
+    content: truncateText(resultText || stringStructured, 2500),
+    summary,
+    isError: !!block?.is_error || /^error:/i.test(stringStructured),
+    structured: normalizedStructured,
+  };
+}
+
+function parseClaudeToolResults(content, toolUseResult = null) {
   if (!content) return [];
   if (!Array.isArray(content)) {
+    if (toolUseResult && typeof toolUseResult === 'object') {
+      return [
+        {
+          type: 'tool_result',
+          tool_use_id: '',
+          content: truncateText(normalizeText(content), 2500),
+          summary: summarizeStructuredToolResult(toolUseResult),
+          structured: compactStructuredValue(toolUseResult),
+          isError: false,
+        },
+      ];
+    }
     return [{ type: 'text', text: truncateText(normalizeText(content), 1500) }];
   }
 
   return content.map((block) => {
     if (block.type === 'tool_result') {
-      const result = Array.isArray(block.content)
-        ? block.content
-            .filter((item) => item.type === 'text')
-            .map((item) => item.text || '')
-            .join('\n')
-        : normalizeText(block.content);
-      return {
-        type: 'tool_result',
-        tool_use_id: block.tool_use_id || '',
-        content: truncateText(result, 1500),
-      };
+      return buildClaudeToolResultBlock(block, toolUseResult);
     }
     return { type: 'text', text: truncateText(JSON.stringify(block), 500) };
   });
@@ -1884,7 +2174,7 @@ async function parseClaudeMessages(filePath) {
       if (effectiveType === 'tool_result') {
         messages.push({
           ...base,
-          content: parseClaudeToolResults(content),
+          content: parseClaudeToolResults(content, obj.toolUseResult || null),
         });
         return;
       }
@@ -1937,6 +2227,7 @@ function parseCodexAssistantBlocks(content) {
 }
 
 function makeAssistantToolMessage(source, timestamp, uuid, roleLabel, toolName, input) {
+  const normalizedInput = normalizeToolPayload(input);
   return {
     type: 'assistant',
     source,
@@ -1948,13 +2239,22 @@ function makeAssistantToolMessage(source, timestamp, uuid, roleLabel, toolName, 
       {
         type: 'tool_use',
         name: toolName || 'tool',
-        input: truncateText(typeof input === 'string' ? input : JSON.stringify(input || {}), 2500),
+        tool_use_id: uuid || '',
+        summary: summarizeToolPayload(toolName || 'tool', normalizedInput),
+        input: compactStructuredValue(normalizedInput),
       },
     ],
   };
 }
 
-function makeToolResultMessage(source, timestamp, uuid, content) {
+function makeToolResultMessage(source, timestamp, uuid, content, extra = {}) {
+  const normalizedContent = normalizeToolPayload(content);
+  const compactContent = typeof normalizedContent === 'string'
+    ? truncateText(normalizedContent, 5000)
+    : compactStructuredValue(normalizedContent);
+  const summary = extra.summary
+    || summarizeStructuredToolResult(normalizedContent)
+    || truncateText(normalizeText(compactContent).split('\n')[0], 180);
   return {
     type: 'tool_result',
     source,
@@ -1965,7 +2265,12 @@ function makeToolResultMessage(source, timestamp, uuid, content) {
       {
         type: 'tool_result',
         tool_use_id: uuid || '',
-        content: truncateText(content, 2500),
+        content: compactContent,
+        summary,
+        isError: !!extra.isError,
+        structured: normalizedContent && typeof normalizedContent === 'object'
+          ? compactStructuredValue(normalizedContent)
+          : null,
       },
     ],
   };
@@ -1973,19 +2278,293 @@ function makeToolResultMessage(source, timestamp, uuid, content) {
 
 function parseCodexToolResultOutput(payload) {
   if (payload.type === 'function_call_output') {
-    return normalizeText(payload.output);
+    return normalizeToolPayload(payload.output);
   }
 
   if (payload.type === 'custom_tool_call_output') {
     const parsed = safeJsonParse(payload.output);
     if (parsed && typeof parsed === 'object') {
-      if (typeof parsed.output === 'string') return parsed.output;
-      return JSON.stringify(parsed);
+      if (typeof parsed.output === 'string') return normalizeToolPayload(parsed.output);
+      return parsed;
     }
-    return normalizeText(payload.output);
+    return normalizeToolPayload(payload.output);
   }
 
-  return normalizeText(payload.output);
+  return normalizeToolPayload(payload.output);
+}
+
+function ensureCodexToolState(state) {
+  if (!state.pendingToolCalls) state.pendingToolCalls = new Map();
+  if (!state.completedToolCalls) state.completedToolCalls = new Set();
+}
+
+function queuePendingCodexToolCall(state, descriptor) {
+  ensureCodexToolState(state);
+  if (!descriptor?.callId) return;
+  state.pendingToolCalls.set(descriptor.callId, descriptor);
+}
+
+function getPendingCodexToolCall(state, callId) {
+  ensureCodexToolState(state);
+  return callId ? (state.pendingToolCalls.get(callId) || null) : null;
+}
+
+function takePendingCodexToolCall(state, callId) {
+  ensureCodexToolState(state);
+  const pending = state.pendingToolCalls.get(callId) || null;
+  if (callId) {
+    state.pendingToolCalls.delete(callId);
+    state.completedToolCalls.add(callId);
+  }
+  return pending;
+}
+
+function hasCompletedCodexToolCall(state, callId) {
+  ensureCodexToolState(state);
+  return !!callId && state.completedToolCalls.has(callId);
+}
+
+function shouldDelayCodexToolOutput(toolName) {
+  return toolName === 'exec_command' || toolName === 'apply_patch';
+}
+
+function storePendingCodexToolOutput(state, callId, output, timestamp) {
+  const pending = getPendingCodexToolCall(state, callId);
+  if (!pending) return null;
+  pending.fallbackOutput = output;
+  pending.fallbackTimestamp = timestamp || pending.fallbackTimestamp || pending.timestamp || '';
+  state.pendingToolCalls.set(callId, pending);
+  return pending;
+}
+
+function extractCodexCommandText(value) {
+  if (!value) return '';
+  if (typeof value === 'string') return value;
+  if (Array.isArray(value)) {
+    if (value.length >= 3 && value[0] === '/bin/bash' && value[1] === '-lc') {
+      return String(value[2] || '');
+    }
+    return value.map((item) => String(item)).join(' ');
+  }
+  if (typeof value === 'object') {
+    if (typeof value.cmd === 'string') return value.cmd;
+    if (typeof value.command === 'string') return value.command;
+  }
+  return '';
+}
+
+function normalizeCodexParsedCommands(parsedCommands) {
+  if (!Array.isArray(parsedCommands)) return [];
+  return parsedCommands.map((entry) => ({
+    type: entry?.type || 'unknown',
+    cmd: typeof entry?.cmd === 'string' ? entry.cmd : '',
+    name: typeof entry?.name === 'string' ? entry.name : '',
+    path: typeof entry?.path === 'string' ? entry.path : '',
+    query: typeof entry?.query === 'string' ? entry.query : '',
+  }));
+}
+
+function buildPatchApplyDiffSource(changes) {
+  if (!changes || typeof changes !== 'object') return '';
+  const parts = [];
+  for (const [pathName, change] of Object.entries(changes)) {
+    if (!change || typeof change !== 'object') continue;
+    const diff = typeof change.unified_diff === 'string' ? change.unified_diff.trim() : '';
+    if (!diff) continue;
+    const nextPath = typeof change.move_path === 'string' && change.move_path
+      ? change.move_path
+      : pathName;
+    parts.push(`--- ${pathName}`);
+    parts.push(`+++ ${nextPath}`);
+    parts.push(diff);
+  }
+  return parts.join('\n');
+}
+
+function buildPatchApplyChanges(changes) {
+  if (!changes || typeof changes !== 'object') return [];
+  return Object.entries(changes).map(([pathName, change]) => ({
+    path: pathName,
+    kind: change?.type || '',
+    movePath: change?.move_path || '',
+    unifiedDiff: typeof change?.unified_diff === 'string' ? change.unified_diff : '',
+  }));
+}
+
+function makeCodexToolActivityMessage(timestamp, callId, data, state) {
+  return {
+    type: 'tool_activity',
+    source: 'codex',
+    sourceLabel: SOURCE_META.codex.label,
+    timestamp: timestamp || '',
+    uuid: callId || '',
+    callId: callId || '',
+    toolName: data.toolName || 'tool',
+    input: data.input ?? null,
+    command: data.command || '',
+    parsedCommands: normalizeCodexParsedCommands(data.parsedCommands),
+    output: typeof data.output === 'string' ? truncateText(data.output, 12000) : normalizeText(data.output),
+    exitCode: Number.isInteger(data.exitCode) ? data.exitCode : null,
+    isError: !!data.isError,
+    changes: Array.isArray(data.changes) ? data.changes : [],
+    diffSource: typeof data.diffSource === 'string' ? data.diffSource : '',
+    summary: data.summary || '',
+    _mergeOrder: nextMessageOrder(state),
+  };
+}
+
+function flushPendingCodexToolCalls(messages, state) {
+  ensureCodexToolState(state);
+  for (const pending of state.pendingToolCalls.values()) {
+    const output = pending.fallbackOutput ?? '';
+    messages.push(
+      makeCodexToolActivityMessage(
+        pending.fallbackTimestamp || pending.timestamp,
+        pending.callId,
+        {
+          toolName: pending.toolName,
+          input: pending.input,
+          command: pending.command,
+          diffSource: pending.toolName === 'apply_patch' && typeof pending.input === 'string'
+            ? pending.input
+            : '',
+          output,
+          summary: summarizeStructuredToolResult(output)
+            || summarizeToolPayload(pending.toolName || 'tool', pending.input),
+        },
+        state,
+      ),
+    );
+  }
+  state.pendingToolCalls.clear();
+}
+
+function codexMessageTimestampMs(message) {
+  if (!message?.timestamp) return Number.NaN;
+  const value = new Date(message.timestamp).getTime();
+  return Number.isFinite(value) ? value : Number.NaN;
+}
+
+function codexMessagesWithinWindow(left, right, windowMs) {
+  const leftMs = codexMessageTimestampMs(left);
+  const rightMs = codexMessageTimestampMs(right);
+  if (!Number.isFinite(leftMs) || !Number.isFinite(rightMs)) return false;
+  return Math.abs(rightMs - leftMs) <= windowMs;
+}
+
+function extractCodexMessageText(message) {
+  if (!message) return '';
+  if (typeof message.content === 'string') {
+    return normalizeText(message.content).trim();
+  }
+  if (Array.isArray(message.content)) {
+    return message.content
+      .map((block) => {
+        if (typeof block?.text === 'string') return block.text;
+        if (typeof block?.summary === 'string') return block.summary;
+        if (typeof block?.content === 'string') return block.content;
+        return '';
+      })
+      .filter(Boolean)
+      .join('\n')
+      .trim();
+  }
+  if (typeof message.summary === 'string') return message.summary.trim();
+  if (typeof message.command === 'string') return message.command.trim();
+  return '';
+}
+
+function codexAssistantDuplicateScore(message) {
+  let score = 0;
+  if (message?.roleLabel === 'CODEX') score += 4;
+  if (message?.roleLabel && message.roleLabel !== 'COMMENTARY') score += 1;
+  if (message?.model) score += 1;
+  score += extractCodexMessageText(message).length;
+  return score;
+}
+
+function codexToolActivityScore(message) {
+  let score = 0;
+  if (message?.input != null) score += 2;
+  if (Array.isArray(message?.parsedCommands) && message.parsedCommands.length) score += 2;
+  if (Number.isInteger(message?.exitCode)) score += 3;
+  if (Array.isArray(message?.changes) && message.changes.length) score += 2;
+  if (message?.isError) score += 1;
+  score += extractCodexMessageText(message).length;
+  return score;
+}
+
+function isDuplicateCodexAssistantMessage(previous, current) {
+  if (previous?.type !== 'assistant' || current?.type !== 'assistant') return false;
+  const previousText = extractCodexMessageText(previous);
+  const currentText = extractCodexMessageText(current);
+  if (!previousText || previousText !== currentText) return false;
+  return codexMessagesWithinWindow(previous, current, 3000);
+}
+
+function isDuplicateCodexStatusMessage(previous, current) {
+  if (previous?.type !== 'status' || current?.type !== 'status') return false;
+  const previousText = extractCodexMessageText(previous);
+  const currentText = extractCodexMessageText(current);
+  if (!previousText || previousText !== currentText) return false;
+  return codexMessagesWithinWindow(previous, current, 5000);
+}
+
+function findRecentCodexStatusDuplicateIndex(messages, current) {
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    const candidate = messages[index];
+    if (candidate?.type === 'status' && isDuplicateCodexStatusMessage(candidate, current)) {
+      return index;
+    }
+    if (candidate?.type === 'tool_activity') {
+      continue;
+    }
+    break;
+  }
+  return -1;
+}
+
+function isDuplicateCodexToolActivity(previous, current) {
+  if (previous?.type !== 'tool_activity' || current?.type !== 'tool_activity') return false;
+  if (!previous.callId || !current.callId || previous.callId !== current.callId) return false;
+  return codexMessagesWithinWindow(previous, current, 5000);
+}
+
+function dedupeCodexMessages(messages) {
+  const deduped = [];
+
+  for (const message of messages || []) {
+    const previous = deduped[deduped.length - 1];
+    if (!previous) {
+      deduped.push(message);
+      continue;
+    }
+
+    if (isDuplicateCodexAssistantMessage(previous, message)) {
+      if (codexAssistantDuplicateScore(message) > codexAssistantDuplicateScore(previous)) {
+        deduped[deduped.length - 1] = message;
+      }
+      continue;
+    }
+
+    const duplicateStatusIndex = message?.type === 'status'
+      ? findRecentCodexStatusDuplicateIndex(deduped, message)
+      : -1;
+    if (duplicateStatusIndex !== -1) {
+      continue;
+    }
+
+    if (isDuplicateCodexToolActivity(previous, message)) {
+      if (codexToolActivityScore(message) >= codexToolActivityScore(previous)) {
+        deduped[deduped.length - 1] = message;
+      }
+      continue;
+    }
+
+    deduped.push(message);
+  }
+
+  return deduped;
 }
 
 
@@ -2005,7 +2584,135 @@ function appendCodexMessageFromObject(obj, messages, state = {}) {
       timestamp: obj.timestamp || '',
       uuid: '',
       content: normalizeText(obj.payload?.message),
+      _mergeOrder: nextMessageOrder(state),
     });
+    return;
+  }
+
+  if (obj.type === 'event_msg' && obj.payload?.type === 'agent_message') {
+    if (obj.payload?.phase === 'final_answer') return;
+    const text = normalizeText(obj.payload?.message);
+    if (!text) return;
+    messages.push({
+      type: 'assistant',
+      source: 'codex',
+      sourceLabel: SOURCE_META.codex.label,
+      timestamp: obj.timestamp || '',
+      uuid: '',
+      roleLabel: obj.payload?.phase === 'commentary' ? 'COMMENTARY' : 'CODEX',
+      content: [{ type: 'text', text }],
+      _mergeOrder: nextMessageOrder(state),
+    });
+    return;
+  }
+
+  if (obj.type === 'event_msg' && obj.payload?.type === 'task_started') {
+    const contextWindow = Number(obj.payload?.model_context_window ?? 0);
+    messages.push({
+      type: 'status',
+      source: 'codex',
+      sourceLabel: SOURCE_META.codex.label,
+      timestamp: obj.timestamp || '',
+      uuid: '',
+      content: contextWindow > 0
+        ? `Task started. Context window ${contextWindow.toLocaleString()} tokens.`
+        : 'Task started.',
+      _mergeOrder: nextMessageOrder(state),
+    });
+    return;
+  }
+
+  if (obj.type === 'event_msg' && obj.payload?.type === 'task_complete') {
+    const durationMs = Number(obj.payload?.duration_ms ?? 0);
+    messages.push({
+      type: 'status',
+      source: 'codex',
+      sourceLabel: SOURCE_META.codex.label,
+      timestamp: normalizeEpochTimestamp(obj.payload?.completed_at) || obj.timestamp || '',
+      uuid: '',
+      content: durationMs > 0
+        ? `Task completed in ${(durationMs / 1000).toFixed(1)}s.`
+        : 'Task completed.',
+      _mergeOrder: nextMessageOrder(state),
+    });
+    return;
+  }
+
+  if (obj.type === 'event_msg' && obj.payload?.type === 'turn_aborted') {
+    messages.push({
+      type: 'status',
+      source: 'codex',
+      sourceLabel: SOURCE_META.codex.label,
+      timestamp: obj.timestamp || '',
+      uuid: '',
+      content: truncateText(normalizeText(obj.payload?.reason || 'Turn aborted.'), 240),
+      _mergeOrder: nextMessageOrder(state),
+    });
+    return;
+  }
+
+  if (obj.type === 'event_msg' && obj.payload?.type === 'token_count') {
+    const summary = buildCodexTokenUsageSummary(obj.payload?.info || null);
+    if (!summary) return;
+    messages.push({
+      type: 'status',
+      source: 'codex',
+      sourceLabel: SOURCE_META.codex.label,
+      timestamp: obj.timestamp || '',
+      uuid: '',
+      content: summary,
+      _mergeOrder: nextMessageOrder(state),
+    });
+    return;
+  }
+
+  if (obj.type === 'event_msg' && obj.payload?.type === 'exec_command_end') {
+    const callId = obj.payload?.call_id || '';
+    const pending = takePendingCodexToolCall(state, callId);
+    const fallbackOutput = pending?.fallbackOutput ?? '';
+    const command = extractCodexCommandText(obj.payload?.command) || pending?.command || '';
+    messages.push(
+      makeCodexToolActivityMessage(
+        obj.timestamp || '',
+        callId,
+        {
+          toolName: pending?.toolName || 'exec_command',
+          input: pending?.input ?? null,
+          command,
+          parsedCommands: obj.payload?.parsed_cmd || [],
+          output: obj.payload?.aggregated_output || fallbackOutput,
+          exitCode: Number.isInteger(obj.payload?.exit_code) ? obj.payload.exit_code : null,
+          isError: obj.payload?.status === 'failed' || Number(obj.payload?.exit_code || 0) !== 0,
+          summary: command || summarizeToolPayload('exec_command', pending?.input ?? command),
+        },
+        state,
+      ),
+    );
+    return;
+  }
+
+  if (obj.type === 'event_msg' && obj.payload?.type === 'patch_apply_end') {
+    const callId = obj.payload?.call_id || '';
+    const pending = takePendingCodexToolCall(state, callId);
+    const fallbackOutput = pending?.fallbackOutput ?? '';
+    const diffSource = (pending && typeof pending.input === 'string' ? pending.input : '')
+      || buildPatchApplyDiffSource(obj.payload?.changes);
+    messages.push(
+      makeCodexToolActivityMessage(
+        obj.timestamp || '',
+        callId,
+        {
+          toolName: pending?.toolName || 'apply_patch',
+          input: pending?.input ?? null,
+          diffSource,
+          output: [obj.payload?.stdout || '', obj.payload?.stderr || ''].filter(Boolean).join('\n') || fallbackOutput,
+          changes: buildPatchApplyChanges(obj.payload?.changes),
+          isError: obj.payload?.success === false,
+          summary: summarizeToolPayload('apply_patch', diffSource || pending?.input || ''),
+        },
+        state,
+      ),
+    );
     return;
   }
 
@@ -2025,35 +2732,31 @@ function appendCodexMessageFromObject(obj, messages, state = {}) {
       model: assistantModel,
       roleLabel: 'CODEX',
       content: parseCodexAssistantBlocks(payload.content),
+      _mergeOrder: nextMessageOrder(state),
     });
     return;
   }
 
   if (payload.type === 'function_call') {
-    messages.push(
-      makeAssistantToolMessage(
-        'codex',
-        timestamp,
-        payload.call_id || '',
-        'CODEX',
-        payload.name,
-        payload.arguments
-      )
-    );
+    const normalizedInput = normalizeToolPayload(payload.arguments);
+    queuePendingCodexToolCall(state, {
+      callId: payload.call_id || '',
+      timestamp,
+      toolName: payload.name || 'tool',
+      input: normalizedInput,
+      command: extractCodexCommandText(normalizedInput),
+    });
     return;
   }
 
   if (payload.type === 'custom_tool_call') {
-    messages.push(
-      makeAssistantToolMessage(
-        'codex',
-        timestamp,
-        payload.call_id || '',
-        'CODEX',
-        payload.name,
-        payload.input
-      )
-    );
+    queuePendingCodexToolCall(state, {
+      callId: payload.call_id || '',
+      timestamp,
+      toolName: payload.name || 'tool',
+      input: payload.input,
+      command: extractCodexCommandText(payload.input),
+    });
     return;
   }
 
@@ -2063,26 +2766,55 @@ function appendCodexMessageFromObject(obj, messages, state = {}) {
       payload.action?.queries ||
       payload.action ||
       '';
-    messages.push(
-      makeAssistantToolMessage(
-        'codex',
-        timestamp,
-        payload.call_id || '',
-        'CODEX',
-        'web_search',
-        searchInput
-      )
-    );
+    queuePendingCodexToolCall(state, {
+      callId: payload.call_id || '',
+      timestamp,
+      toolName: 'web_search',
+      input: searchInput,
+      command: '',
+    });
     return;
   }
 
   if (payload.type === 'function_call_output' || payload.type === 'custom_tool_call_output') {
+    const callId = payload.call_id || '';
+    if (hasCompletedCodexToolCall(state, callId)) {
+      return;
+    }
+    const pending = getPendingCodexToolCall(state, callId);
+    const parsedOutput = parseCodexToolResultOutput(payload);
+    if (pending) {
+      if (shouldDelayCodexToolOutput(pending.toolName)) {
+        storePendingCodexToolOutput(state, callId, parsedOutput, timestamp);
+        return;
+      }
+      takePendingCodexToolCall(state, callId);
+      messages.push(
+        makeCodexToolActivityMessage(
+          timestamp,
+          callId,
+          {
+            toolName: pending.toolName,
+            input: pending.input,
+            command: pending.command,
+            output: parsedOutput,
+            diffSource: pending.toolName === 'apply_patch' && typeof pending.input === 'string'
+              ? pending.input
+              : '',
+            summary: summarizeStructuredToolResult(parsedOutput)
+              || summarizeToolPayload(pending.toolName || 'tool', pending.input),
+          },
+          state,
+        ),
+      );
+      return;
+    }
     messages.push(
       makeToolResultMessage(
         'codex',
         timestamp,
         payload.call_id || '',
-        parseCodexToolResultOutput(payload)
+        parsedOutput
       )
     );
   }
@@ -2122,13 +2854,22 @@ async function loadRecentCodexMessages(filePath, limit) {
       appendCodexMessageFromObject(obj, messages, state);
     }
 
-    if (messages.length >= limit || rawLines.length < lineCount || lineCount >= RECENT_TAIL_LINES_MAX) {
-      const sliced = messages.slice(-limit);
+    flushPendingCodexToolCalls(messages, state);
+    const dedupedMessages = dedupeCodexMessages(messages);
+
+    if (dedupedMessages.length >= limit || rawLines.length < lineCount || lineCount >= RECENT_TAIL_LINES_MAX) {
+      const sliced = dedupedMessages.slice(-limit);
       const reachedStart = rawLines.length < lineCount;
+      if (!reachedStart && lineCount >= RECENT_TAIL_LINES_MAX) {
+        return null;
+      }
+      const total = reachedStart
+        ? dedupedMessages.length
+        : sliced.length + 1;
       return {
         messages: sliced,
-        total: reachedStart ? messages.length : null,
-        hasMore: reachedStart ? messages.length > sliced.length : true,
+        total,
+        hasMore: reachedStart ? dedupedMessages.length > sliced.length : true,
       };
     }
 
@@ -2153,7 +2894,10 @@ async function parseCodexMessages(filePath) {
       appendCodexMessageFromObject(obj, messages, state);
     });
 
-    rl.on('close', () => resolve(messages));
+    rl.on('close', () => {
+      flushPendingCodexToolCalls(messages, state);
+      resolve(dedupeCodexMessages(messages));
+    });
     rl.on('error', reject);
   });
 }
@@ -2317,6 +3061,144 @@ async function loadMessagesForLocator(locator) {
 
   setMessageCache(cacheKey, fingerprint, messages);
   return messages;
+}
+
+function getHiddenCodexSubagentSessionsForLocator(snapshot, locator) {
+  if (!locator || locator.source !== 'codex' || !snapshot?.hiddenCodexSubagentsByParent) {
+    return [];
+  }
+
+  const key = buildCodexSubagentParentKey(locator.projectPath, locator.rawSessionId);
+  return snapshot.hiddenCodexSubagentsByParent.get(key) || [];
+}
+
+function buildCodexSubagentStatus(subagentSession, childMessages) {
+  if (subagentSession?.completedAt) return 'completed';
+  const reversedMessages = [...(childMessages || [])].reverse();
+  const lastStatusText = reversedMessages
+    .find((message) => message.type === 'status' && hasNonEmptyText(message.content))
+    ?.content || '';
+  if (typeof lastStatusText === 'string') {
+    if (/aborted|interrupt/i.test(lastStatusText)) return 'aborted';
+    if (/failed|error/i.test(lastStatusText)) return 'failed';
+  }
+
+  const modifiedMs = parseTimestampMs(subagentSession?.modified || '');
+  const lastMessageMs = reversedMessages
+    .map((message) => parseTimestampMs(message?.timestamp || ''))
+    .find((value) => Number.isFinite(value));
+  const newestMs = Number.isFinite(lastMessageMs)
+    ? lastMessageMs
+    : modifiedMs;
+  if (Number.isFinite(newestMs) && (Date.now() - newestMs) > 30 * 60 * 1000) {
+    return 'completed';
+  }
+
+  if ((childMessages || []).length > 0) {
+    return 'active';
+  }
+  return 'started';
+}
+
+function summarizeCodexSubagentMessages(subagentSession, childMessages) {
+  const lastAssistant = [...(childMessages || [])]
+    .reverse()
+    .find((message) => message.type === 'assistant' && Array.isArray(message.content));
+  const assistantText = lastAssistant?.content
+    ?.find((block) => block.type === 'text' && hasNonEmptyText(block.text))
+    ?.text || '';
+  if (assistantText) {
+    return truncateText(assistantText.replace(/\s+/g, ' ').trim(), 220);
+  }
+
+  const lastStatus = [...(childMessages || [])]
+    .reverse()
+    .find((message) => message.type === 'status' && hasNonEmptyText(message.content));
+  if (lastStatus?.content) {
+    return truncateText(String(lastStatus.content), 220);
+  }
+
+  if (subagentSession?.firstPrompt) {
+    return truncateText(subagentSession.firstPrompt, 220);
+  }
+
+  return '';
+}
+
+async function buildCodexSubagentGroupMessage(subagentSession, index, options = {}) {
+  const childLocator = {
+    source: 'codex',
+    projectPath: subagentSession.projectPath,
+    relativePath: subagentSession.relativePath,
+    rawSessionId: subagentSession.rawSessionId,
+  };
+  const allMessages = await loadMessagesForLocator(childLocator);
+  const tailLimit = Number(options.tailLimit || 0);
+  const nestedMessages = tailLimit > 0 ? allMessages.slice(-tailLimit) : allMessages;
+  const startedAt = subagentSession.created || allMessages[0]?.timestamp || '';
+  const status = buildCodexSubagentStatus(subagentSession, allMessages);
+
+  return {
+    type: 'subagent_group',
+    source: 'codex',
+    sourceLabel: SOURCE_META.codex.label,
+    timestamp: startedAt,
+    uuid: `subagent:${subagentSession.rawSessionId}`,
+    _mergeOrder: Number.isFinite(index) ? index + 1 : 1,
+    subagent: {
+      rawSessionId: subagentSession.rawSessionId || '',
+      parentThreadId: subagentSession.parentThreadId || '',
+      nickname: subagentSession.agentNickname || '',
+      role: subagentSession.agentRole || '',
+      depth: subagentSession.depth || 0,
+      status,
+      startedAt,
+      completedAt: subagentSession.completedAt || '',
+      durationMs: subagentSession.durationMs || 0,
+    },
+    messageCount: allMessages.length,
+    totalMessages: allMessages.length,
+    summary: summarizeCodexSubagentMessages(subagentSession, allMessages),
+    hasMoreMessages: nestedMessages.length < allMessages.length,
+    messages: nestedMessages,
+  };
+}
+
+async function loadCodexSubagentGroupMessages(locator, snapshot, options = {}) {
+  const subagentSessions = getHiddenCodexSubagentSessionsForLocator(snapshot, locator);
+  if (!subagentSessions.length) return [];
+
+  const groups = await Promise.all(
+    subagentSessions.map((subagentSession, index) => buildCodexSubagentGroupMessage(
+      subagentSession,
+      index,
+      options,
+    )),
+  );
+
+  return groups.sort(compareTimestampedItems);
+}
+
+async function loadMergedMessagesForLocator(locator, snapshot, options = {}) {
+  const baseMessages = await loadMessagesForLocator(locator);
+  const subagentGroups = await loadCodexSubagentGroupMessages(locator, snapshot, options);
+  if (!subagentGroups.length) {
+    return baseMessages;
+  }
+
+  const merged = [
+    ...baseMessages.map((message, index) => ({
+      ...message,
+      _mergeOrder: Number.isFinite(message?._mergeOrder) ? message._mergeOrder : (index + 1),
+    })),
+    ...subagentGroups.map((message, index) => ({
+      ...message,
+      _mergeOrder: baseMessages.length + index + 1,
+    })),
+  ];
+
+  merged.sort(compareTimestampedItems);
+  return merged;
 }
 
 function resolveSessionStorage(locator) {
@@ -2500,17 +3382,29 @@ async function handleGetMessages(req, res, projectToken, sessionToken, query) {
   const offset = parseInt(query.get('offset') || '0', 10);
   const limit = parseInt(query.get('limit') || '50', 10);
   const direction = query.get('direction') || 'newest';
+  const forceFresh = query.get('fresh') === '1';
 
   try {
-    if (direction === 'newest' && offset === 0) {
+    const snapshot = await getSessionsSnapshot(forceFresh);
+    const hasHiddenSubagents = getHiddenCodexSubagentSessionsForLocator(snapshot, locator).length > 0;
+
+    if (direction === 'newest' && offset === 0 && !hasHiddenSubagents) {
       const recent = await loadRecentMessagesForLocator(locator, limit);
       if (recent) {
-        sendJSON(res, recent);
+        sendJSON(res, {
+          messages: Array.isArray(recent.messages) ? recent.messages : [],
+          total: Number.isFinite(recent.total) ? recent.total : (
+            Array.isArray(recent.messages) ? recent.messages.length + (recent.hasMore ? 1 : 0) : 0
+          ),
+          hasMore: !!recent.hasMore,
+        });
         return;
       }
     }
 
-    const allMessages = await loadMessagesForLocator(locator);
+    const allMessages = hasHiddenSubagents
+      ? await loadMergedMessagesForLocator(locator, snapshot)
+      : await loadMessagesForLocator(locator);
     const total = allMessages.length;
 
     let sliced = [];
@@ -2528,6 +3422,37 @@ async function handleGetMessages(req, res, projectToken, sessionToken, query) {
     sendJSON(res, { messages: sliced, total, hasMore });
   } catch (err) {
     sendError(res, 'Failed to read messages: ' + err.message);
+  }
+}
+
+async function handleGetSubagentGroups(req, res, projectToken, sessionToken, query) {
+  const project = decodeToken(projectToken);
+  const locator = decodeToken(sessionToken);
+
+  if (!project?.projectPath || !locator?.projectPath) {
+    sendError(res, 'Invalid session locator', 400);
+    return;
+  }
+
+  if (project.projectPath !== locator.projectPath) {
+    sendError(res, 'Session does not belong to the selected project', 400);
+    return;
+  }
+
+  const forceFresh = query.get('fresh') === '1';
+  const tailLimit = parseInt(query.get('tail') || '0', 10);
+
+  try {
+    const snapshot = await getSessionsSnapshot(forceFresh);
+    const groups = await loadCodexSubagentGroupMessages(locator, snapshot, {
+      tailLimit: Number.isFinite(tailLimit) && tailLimit > 0 ? tailLimit : 0,
+    });
+    sendJSON(res, {
+      groups,
+      total: groups.length,
+    });
+  } catch (err) {
+    sendError(res, 'Failed to read subagent groups: ' + err.message);
   }
 }
 
@@ -2697,6 +3622,17 @@ async function handleRequest(req, res) {
       decodeURIComponent(messagesMatch[1]),
       decodeURIComponent(messagesMatch[2]),
       query
+    );
+  }
+
+  const subagentGroupsMatch = pathname.match(/^\/api\/subagent-groups\/([^/]+)\/([^/]+)$/);
+  if (subagentGroupsMatch && req.method === 'GET') {
+    return handleGetSubagentGroups(
+      req,
+      res,
+      decodeURIComponent(subagentGroupsMatch[1]),
+      decodeURIComponent(subagentGroupsMatch[2]),
+      query,
     );
   }
 

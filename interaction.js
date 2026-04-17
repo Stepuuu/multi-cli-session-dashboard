@@ -17,14 +17,18 @@ const VSCODE_EXTENSIONS_DIR = _cfg.vscodeExtensionsDir;
 const VSCODE_CODEX_EXTENSION_PREFIX = 'openai.chatgpt-';
 const DEFAULT_CODEX_BINARY = _cfg.codexBin || 'codex';
 const DEFAULT_CODEX_ORIGINATOR = 'codex_vscode';
-const CODEX_REQUEST_TIMEOUT_MS = 30000;
-const CODEX_THREAD_RESUME_TIMEOUT_MS = 60000;
+const CODEX_REQUEST_TIMEOUT_MS = 60000;
+const CODEX_THREAD_RESUME_TIMEOUT_MS = 150000;
 const CODEX_THREAD_RESUME_MAX_ATTEMPTS = 2;
 const CODEX_THREAD_RESUME_RETRY_DELAY_MS = 800;
+const CODEX_THREAD_RESUME_STATUS_INTERVAL_MS = 15000;
+const CODEX_WARM_IDLE_TTL_MS = 10 * 60 * 1000;
+const CODEX_WARM_SELF_REFRESH_GRACE_MS = 10000;
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const CLAUDE_MODELS_FILE = _cfg.claudeModelsFile;
 const CLAUDE_PROVENANCE_FILE = path.join(__dirname, 'data', 'claude-session-provenance.json');
 let resolvedCodexBinaryPromise = null;
+let sharedCodexWarmWorker = null;
 
 function safeJsonParse(text) {
   try {
@@ -504,6 +508,51 @@ function formatFileChanges(item) {
   return `Updated files:\n${lines.join('\n')}`;
 }
 
+function buildCodexCommandStartEvent(item) {
+  const command = formatCommandForDisplay(item?.command || '');
+  return {
+    type: 'tool_event',
+    toolName: 'shell_command',
+    summary: truncateText(command.split('\n')[0] || 'shell_command', 180),
+    command,
+    content: command
+      ? `shell_command\n\`\`\`bash\n${command}\n\`\`\``
+      : 'shell_command',
+  };
+}
+
+function buildCodexCommandResultEvent(item, formatter) {
+  const command = formatCommandForDisplay(item?.command || '');
+  const exitCode = Number.isInteger(item?.exitCode) ? item.exitCode : item?.exit_code;
+  const aggregatedOutput = typeof item?.aggregatedOutput === 'string'
+    ? item.aggregatedOutput
+    : (typeof item?.aggregated_output === 'string' ? item.aggregated_output : '');
+  return {
+    type: 'tool_result',
+    toolName: 'shell_command',
+    summary: Number.isInteger(exitCode)
+      ? `Exit code ${exitCode}`
+      : truncateText((aggregatedOutput || command || 'shell_command').split('\n')[0], 180),
+    command,
+    exitCode: Number.isInteger(exitCode) ? exitCode : null,
+    aggregatedOutput,
+    content: formatter(item),
+  };
+}
+
+function buildCodexFileChangeEvent(item, formatter) {
+  const changes = Array.isArray(item?.changes) ? item.changes : [];
+  return {
+    type: 'tool_event',
+    toolName: 'apply_patch',
+    summary: changes.length
+      ? truncateText(changes.map((change) => change.path).join(', '), 180)
+      : 'Updated files.',
+    changes,
+    content: `apply_patch\n${formatter(item)}`,
+  };
+}
+
 function parseCodexLine(line, res) {
   const obj = safeJsonParse(line);
   if (!obj) {
@@ -521,24 +570,15 @@ function parseCodexLine(line, res) {
     return;
   }
   if (obj.type === 'item.started' && obj.item?.type === 'command_execution') {
-    sendEvent(res, {
-      type: 'tool_event',
-      message: `shell_command\n\`\`\`bash\n${formatCommandForDisplay(obj.item.command)}\n\`\`\``,
-    });
+    sendEvent(res, buildCodexCommandStartEvent(obj.item));
     return;
   }
   if (obj.type === 'item.completed' && obj.item?.type === 'command_execution') {
-    sendEvent(res, {
-      type: 'tool_result',
-      message: formatCommandResult(obj.item),
-    });
+    sendEvent(res, buildCodexCommandResultEvent(obj.item, formatCommandResult));
     return;
   }
   if (obj.type === 'item.completed' && obj.item?.type === 'file_change') {
-    sendEvent(res, {
-      type: 'tool_event',
-      message: `apply_patch\n${formatFileChanges(obj.item)}`,
-    });
+    sendEvent(res, buildCodexFileChangeEvent(obj.item, formatFileChanges));
     return;
   }
   if (obj.type === 'item.completed' && obj.item?.type === 'agent_message') {
@@ -666,7 +706,619 @@ function shouldIgnoreCodexAppServerLogLine(text) {
   ].some((pattern) => pattern.test(text));
 }
 
-async function streamCodexAppServerInteraction(res, req, options) {
+function buildCodexWarmEnvSignature(env = {}) {
+  return JSON.stringify(
+    Object.entries(env || {})
+      .sort(([left], [right]) => left.localeCompare(right))
+      .map(([key, value]) => [key, String(value)]),
+  );
+}
+
+function buildCodexWarmReuseKey(options) {
+  return JSON.stringify({
+    command: options.command || '',
+    cwd: options.cwd || '',
+    rawSessionId: options.threadTarget?.rawSessionId || '',
+    env: buildCodexWarmEnvSignature(options.env || {}),
+  });
+}
+
+async function resolveCodexTranscriptFingerprint(options) {
+  const relativePath = options.locator?.relativePath || '';
+  const codexSessionsDir = options.config?.codexSessionsDir || '';
+  if (!relativePath || !codexSessionsDir) return '';
+  try {
+    const stat = await fsp.stat(path.join(codexSessionsDir, relativePath));
+    return `${Math.floor(stat.mtimeMs)}:${stat.size}`;
+  } catch {
+    return '';
+  }
+}
+
+function canUseWarmCodexWorker(options) {
+  return Boolean(
+    options.threadTarget?.mode === 'resume' &&
+    options.threadTarget?.rawSessionId &&
+    options.locator?.relativePath &&
+    options.config?.codexSessionsDir,
+  );
+}
+
+function clearSharedCodexWarmWorker(worker) {
+  if (sharedCodexWarmWorker === worker) {
+    sharedCodexWarmWorker = null;
+  }
+}
+
+class CodexWarmWorker {
+  constructor(options) {
+    this.command = options.command;
+    this.cwd = options.cwd;
+    this.env = options.env || {};
+    this.reuseKey = options.reuseKey;
+    this.locator = options.locator;
+    this.config = options.config;
+    this.currentThreadId = '';
+    this.threadReady = false;
+    this.initialized = false;
+    this.closed = false;
+    this.activeRequest = null;
+    this.pendingRequests = new Map();
+    this.nextRequestId = 1;
+    this.stderr = '';
+    this.idleTimer = null;
+    this.forceKillTimer = null;
+    this.fingerprintRefreshTimer = null;
+    this.lastTurnCompletedAt = 0;
+    this.transcriptFingerprint = options.transcriptFingerprint || '';
+    this.needsFingerprintRefresh = false;
+    this.child = spawn(this.command, ['app-server', '--analytics-default-enabled'], {
+      cwd: this.cwd,
+      env: buildCodexAppServerEnv(this.env),
+      stdio: ['pipe', 'pipe', 'pipe'],
+    });
+    this.attachProcessHandlers();
+  }
+
+  describeContext() {
+    return `(cwd=${this.cwd}, thread=${this.currentThreadId || this.locator?.rawSessionId || ''})`;
+  }
+
+  attachProcessHandlers() {
+    processJsonLines(this.child.stdout, (line) => {
+      const message = safeJsonParse(line);
+      if (!message) {
+        this.sendStatusToActive(truncateText(line, 400));
+        return;
+      }
+
+      if (
+        Object.prototype.hasOwnProperty.call(message, 'id') &&
+        (Object.prototype.hasOwnProperty.call(message, 'result') ||
+          Object.prototype.hasOwnProperty.call(message, 'error'))
+      ) {
+        const id = String(message.id);
+        const pending = this.pendingRequests.get(id);
+        if (!pending) return;
+        clearTimeout(pending.timer);
+        this.pendingRequests.delete(id);
+        const elapsedMs = Date.now() - (pending.startedAt || Date.now());
+        if (elapsedMs >= 5000) {
+          console.warn(
+            `[session-dashboard] Codex ${pending.method} completed in ${elapsedMs}ms ${this.describeContext()}`,
+          );
+        }
+        if (message.error) {
+          pending.reject(new Error(message.error.message || `${pending.method} failed.`));
+          return;
+        }
+        pending.resolve(message.result);
+        return;
+      }
+
+      if (Object.prototype.hasOwnProperty.call(message, 'id')) {
+        this.handleServerRequest(message);
+        return;
+      }
+
+      if (message.method) {
+        this.handleNotification(message);
+      }
+    });
+
+    this.child.stderr.on('data', (chunk) => {
+      const lines = chunk
+        .toString('utf-8')
+        .split(/\r?\n/)
+        .map((line) => line.trim())
+        .filter(Boolean)
+        .filter((line) => !shouldIgnoreCodexAppServerLogLine(line));
+
+      if (!lines.length) return;
+
+      const text = lines.join('\n');
+      this.stderr += (this.stderr ? '\n' : '') + text;
+      for (const line of lines) {
+        this.sendStatusToActive(truncateText(line, 400));
+      }
+    });
+
+    this.child.on('error', (err) => {
+      this.handleChildShutdown(err.message || 'Failed to start Codex app-server.');
+    });
+
+    this.child.on('close', (code) => {
+      if (this.forceKillTimer) {
+        clearTimeout(this.forceKillTimer);
+        this.forceKillTimer = null;
+      }
+      const active = this.activeRequest;
+      const graceful = !!active?.turnCompleted || code === 0;
+      const message = graceful
+        ? ''
+        : (this.stderr.trim() || `Codex app-server exited with code ${code}`);
+      this.closed = true;
+      clearSharedCodexWarmWorker(this);
+      for (const { reject, timer } of this.pendingRequests.values()) {
+        clearTimeout(timer);
+        reject(new Error('Codex app-server interaction ended before the request completed.'));
+      }
+      this.pendingRequests.clear();
+      if (active && !active.finished) {
+        this.finishActiveRequest(message ? { type: 'error', message } : null);
+      }
+    });
+  }
+
+  handleChildShutdown(message) {
+    if (!message && this.closed) return;
+    this.destroy('child-shutdown');
+    if (this.activeRequest && !this.activeRequest.finished) {
+      this.finishActiveRequest({ type: 'error', message: message || 'Codex app-server interaction failed.' });
+    }
+  }
+
+  handleServerRequest(message) {
+    const method = message?.method;
+    const id = message?.id;
+    if (id == null || !method) return;
+
+    if (
+      method === 'item/commandExecution/requestApproval' ||
+      method === 'item/fileChange/requestApproval' ||
+      method === 'execCommandApproval' ||
+      method === 'applyPatchApproval'
+    ) {
+      this.sendResponse(id, { decision: 'denied' });
+      return;
+    }
+
+    if (method === 'item/permissions/requestApproval') {
+      this.sendResponse(id, { permissions: {}, scope: 'turn' });
+      return;
+    }
+
+    if (method === 'item/tool/requestUserInput') {
+      this.sendResponse(id, { answers: {} });
+      return;
+    }
+
+    if (method === 'mcpServer/elicitation/request') {
+      this.sendResponse(id, { action: 'cancel', content: null, _meta: null });
+      return;
+    }
+
+    if (method === 'item/tool/call') {
+      this.sendResponse(id, { contentItems: [], success: false });
+      return;
+    }
+
+    this.sendErrorResponse(id, `Unsupported app-server request: ${method}`, -32601);
+  }
+
+  handleNotification(message) {
+    const method = message?.method;
+    const params = message?.params || {};
+    const active = this.activeRequest;
+    if (!method) return;
+
+    if (method === 'thread/started') {
+      this.currentThreadId = params?.thread?.id || this.currentThreadId;
+      this.threadReady = true;
+      if (active && !active.finished) {
+        sendEvent(active.res, { type: 'meta', source: 'codex', sessionId: this.currentThreadId });
+        if (active.expectSessionCreated && this.currentThreadId && !active.sentSessionCreated) {
+          active.sentSessionCreated = true;
+          sendEvent(active.res, { type: 'session_created', source: 'codex', rawSessionId: this.currentThreadId });
+        }
+      }
+      return;
+    }
+
+    if (!active || active.finished) return;
+
+    if (method === 'turn/started') {
+      sendEvent(active.res, {
+        type: 'status',
+        message: active.turnStartedMessage || 'Codex resumed the selected session.',
+      });
+      return;
+    }
+
+    if (method === 'item/agentMessage/delta' && params?.delta) {
+      sendEvent(active.res, {
+        type: 'assistant_delta',
+        text: params.delta,
+        itemId: params.itemId || '',
+      });
+      return;
+    }
+
+    if (method === 'item/started' && params?.item?.type === 'commandExecution') {
+      sendEvent(active.res, buildCodexCommandStartEvent(params.item));
+      return;
+    }
+
+    if (method === 'item/completed' && params?.item?.type === 'commandExecution') {
+      sendEvent(active.res, buildCodexCommandResultEvent(params.item, formatAppServerCommandResult));
+      return;
+    }
+
+    if (method === 'item/completed' && params?.item?.type === 'fileChange') {
+      sendEvent(active.res, buildCodexFileChangeEvent(params.item, formatAppServerFileChanges));
+      return;
+    }
+
+    if (method === 'item/completed' && params?.item?.type === 'agentMessage') {
+      sendEvent(active.res, {
+        type: 'assistant_final',
+        text: params.item.text || '',
+        itemId: params.item.id || '',
+        phase: params.item.phase || '',
+      });
+      return;
+    }
+
+    if (method === 'thread/tokenUsage/updated') {
+      const usageMessage = buildCodexTokenUsageMessage(params?.tokenUsage);
+      if (usageMessage) {
+        sendEvent(active.res, { type: 'status', message: usageMessage });
+      }
+      return;
+    }
+
+    if (method === 'error') {
+      const details = params?.message || params?.error || 'Codex app-server interaction failed.';
+      sendEvent(active.res, { type: 'error', message: truncateText(normalizeText(details), 800) });
+      return;
+    }
+
+    if (method === 'turn/completed') {
+      active.turnCompleted = true;
+      this.lastTurnCompletedAt = Date.now();
+      this.needsFingerprintRefresh = true;
+      this.scheduleFingerprintRefresh();
+      sendEvent(active.res, { type: 'status', message: 'Codex turn completed.' });
+      this.finishActiveRequest({ type: 'done', exitCode: 0 });
+    }
+  }
+
+  scheduleFingerprintRefresh() {
+    if (this.fingerprintRefreshTimer) {
+      clearTimeout(this.fingerprintRefreshTimer);
+      this.fingerprintRefreshTimer = null;
+    }
+    this.fingerprintRefreshTimer = setTimeout(async () => {
+      this.fingerprintRefreshTimer = null;
+      const fingerprint = await resolveCodexTranscriptFingerprint({
+        locator: this.locator,
+        config: this.config,
+      });
+      if (fingerprint) {
+        this.transcriptFingerprint = fingerprint;
+      }
+      this.needsFingerprintRefresh = false;
+    }, 1200);
+    this.fingerprintRefreshTimer.unref?.();
+  }
+
+  clearIdleTimer() {
+    if (this.idleTimer) {
+      clearTimeout(this.idleTimer);
+      this.idleTimer = null;
+    }
+  }
+
+  scheduleIdleTimer() {
+    this.clearIdleTimer();
+    if (this.closed) return;
+    this.idleTimer = setTimeout(() => {
+      console.warn(`[session-dashboard] Disposing idle warm Codex worker ${this.describeContext()}`);
+      this.destroy('idle-timeout');
+    }, CODEX_WARM_IDLE_TTL_MS);
+    this.idleTimer.unref?.();
+  }
+
+  sendStatusToActive(message) {
+    const active = this.activeRequest;
+    if (!active || active.finished || active.clientDisconnected) return;
+    sendEvent(active.res, { type: 'status', message });
+  }
+
+  createActiveRequest(res, req) {
+    let resolveCompletion;
+    const active = {
+      res,
+      req,
+      finished: false,
+      clientDisconnected: false,
+      sentSessionCreated: false,
+      expectSessionCreated: false,
+      turnCompleted: false,
+      turnStartedMessage: 'Codex resumed the selected session.',
+      completionPromise: new Promise((resolve) => {
+        resolveCompletion = resolve;
+      }),
+      resolveCompletion: () => resolveCompletion?.(),
+      onAbort: null,
+      onClose: null,
+    };
+
+    active.onAbort = () => {
+      if (active.finished) return;
+      active.clientDisconnected = true;
+      this.finishActiveRequest(null);
+      this.destroy('client-aborted');
+    };
+
+    active.onClose = () => {
+      if (active.finished) return;
+      active.clientDisconnected = true;
+      this.finishActiveRequest(null);
+      this.destroy('client-closed');
+    };
+
+    req.on('aborted', active.onAbort);
+    res.on('close', active.onClose);
+    return active;
+  }
+
+  finishActiveRequest(payload) {
+    const active = this.activeRequest;
+    if (!active || active.finished) return;
+    active.finished = true;
+    active.req.off('aborted', active.onAbort);
+    active.res.off('close', active.onClose);
+    this.activeRequest = null;
+    if (!active.clientDisconnected) {
+      if (payload) sendEvent(active.res, payload);
+      active.res.end();
+    }
+    active.resolveCompletion();
+    if (!this.closed) {
+      this.scheduleIdleTimer();
+    }
+  }
+
+  writeMessage(message) {
+    if (this.closed || this.child.stdin.destroyed) {
+      throw new Error('Codex app-server stdin is unavailable.');
+    }
+    this.child.stdin.write(JSON.stringify(message) + '\n');
+  }
+
+  sendRequest(method, params, timeoutMs = CODEX_REQUEST_TIMEOUT_MS) {
+    const id = String(this.nextRequestId++);
+    const startedAt = Date.now();
+    return new Promise((resolveRequest, rejectRequest) => {
+      const timer = setTimeout(() => {
+        this.pendingRequests.delete(id);
+        console.warn(`[session-dashboard] Codex ${method} timed out after ${timeoutMs}ms ${this.describeContext()}`);
+        rejectRequest(new Error(`Timed out waiting for ${method} response.`));
+      }, timeoutMs);
+      this.pendingRequests.set(id, {
+        resolve: resolveRequest,
+        reject: rejectRequest,
+        timer,
+        method,
+        startedAt,
+      });
+      try {
+        this.writeMessage({ id, method, params });
+      } catch (err) {
+        clearTimeout(timer);
+        this.pendingRequests.delete(id);
+        rejectRequest(err);
+      }
+    });
+  }
+
+  sendNotification(method, params) {
+    this.writeMessage(params === undefined ? { method } : { method, params });
+  }
+
+  sendResponse(id, result) {
+    this.writeMessage({ id, result });
+  }
+
+  sendErrorResponse(id, message, code = -32603) {
+    this.writeMessage({
+      id,
+      error: {
+        code,
+        message,
+      },
+    });
+  }
+
+  async ensureInitialized(res) {
+    if (this.initialized) {
+      sendEvent(res, { type: 'meta', source: 'codex', sessionId: this.currentThreadId || '' });
+      sendEvent(res, { type: 'status', message: 'Reusing warm Codex worker.' });
+      return;
+    }
+    const initResult = await this.sendRequest('initialize', {
+      clientInfo: codexClientInfo(this.command),
+      capabilities: {
+        experimentalApi: true,
+      },
+    });
+    this.sendNotification('initialized');
+    this.initialized = true;
+    sendEvent(res, { type: 'meta', source: 'codex', sessionId: this.currentThreadId || '' });
+    sendEvent(res, {
+      type: 'status',
+      message: `Connected to Codex app-server (${initResult?.platformOs || 'unknown platform'}).`,
+    });
+  }
+
+  async ensureResumed(active, options) {
+    if (this.threadReady && this.currentThreadId === options.threadTarget.rawSessionId) {
+      sendEvent(active.res, {
+        type: 'status',
+        message: 'Warm Codex session state is already loaded.',
+      });
+      active.turnStartedMessage = 'Codex continued the selected session.';
+      return;
+    }
+
+    let lastResumeError = null;
+    for (let attempt = 1; attempt <= CODEX_THREAD_RESUME_MAX_ATTEMPTS; attempt += 1) {
+      const resumeStartedAt = Date.now();
+      const resumeHeartbeat = setInterval(() => {
+        const elapsedSec = Math.floor((Date.now() - resumeStartedAt) / 1000);
+        sendEvent(active.res, {
+          type: 'status',
+          message: `Still waiting for Codex session resume (${elapsedSec}s)...`,
+        });
+      }, CODEX_THREAD_RESUME_STATUS_INTERVAL_MS);
+      resumeHeartbeat.unref?.();
+      sendEvent(active.res, {
+        type: 'status',
+        message: attempt === 1
+          ? 'Resuming selected Codex session...'
+          : `Retrying Codex session resume (${attempt}/${CODEX_THREAD_RESUME_MAX_ATTEMPTS})...`,
+      });
+      try {
+        const thread = await this.sendRequest('thread/resume', {
+          threadId: options.threadTarget.rawSessionId,
+          cwd: options.cwd,
+          approvalPolicy: 'never',
+          sandbox: 'danger-full-access',
+          persistExtendedHistory: true,
+        }, CODEX_THREAD_RESUME_TIMEOUT_MS);
+        this.currentThreadId = thread?.thread?.id || options.threadTarget.rawSessionId;
+        this.threadReady = true;
+        this.transcriptFingerprint = options.transcriptFingerprint || this.transcriptFingerprint;
+        this.needsFingerprintRefresh = false;
+        active.turnStartedMessage = 'Codex resumed the selected session.';
+        clearInterval(resumeHeartbeat);
+        return;
+      } catch (err) {
+        lastResumeError = err;
+        clearInterval(resumeHeartbeat);
+        if (attempt >= CODEX_THREAD_RESUME_MAX_ATTEMPTS) {
+          throw err;
+        }
+        sendEvent(active.res, {
+          type: 'status',
+          message: `${err.message || 'Codex resume failed.'} Retrying...`,
+        });
+        await delay(CODEX_THREAD_RESUME_RETRY_DELAY_MS);
+      }
+    }
+    if (lastResumeError) throw lastResumeError;
+  }
+
+  canReuse(reuseKey, fingerprint) {
+    if (this.closed) return { ok: false, reason: 'closed' };
+    if (this.reuseKey !== reuseKey) return { ok: false, reason: 'session-mismatch' };
+    if (this.activeRequest) return { ok: false, reason: 'busy' };
+    if (!fingerprint || !this.transcriptFingerprint || this.transcriptFingerprint === fingerprint) {
+      return { ok: true, reason: 'exact-match' };
+    }
+    const withinGrace = this.needsFingerprintRefresh &&
+      (Date.now() - this.lastTurnCompletedAt) <= CODEX_WARM_SELF_REFRESH_GRACE_MS;
+    if (withinGrace) {
+      this.transcriptFingerprint = fingerprint;
+      this.needsFingerprintRefresh = false;
+      return { ok: true, reason: 'self-refresh-grace' };
+    }
+    return { ok: false, reason: 'transcript-changed' };
+  }
+
+  async runInteraction(res, req, options) {
+    if (this.activeRequest) {
+      throw new Error('Warm Codex worker is busy.');
+    }
+    this.clearIdleTimer();
+    const active = this.createActiveRequest(res, req);
+    this.activeRequest = active;
+
+    try {
+      await this.ensureInitialized(res);
+      await this.ensureResumed(active, options);
+
+      const threadId = this.currentThreadId || options.threadTarget.rawSessionId;
+      if (!threadId) {
+        throw new Error('Codex app-server did not return a thread id.');
+      }
+
+      sendEvent(res, { type: 'meta', source: 'codex', sessionId: threadId });
+
+      const input = buildCodexInputItems(options.text, options.imageFiles);
+      if (!input.length) {
+        throw new Error('No Codex input items were generated for this interaction.');
+      }
+
+      await this.sendRequest('turn/start', {
+        threadId,
+        input,
+        cwd: options.cwd,
+        approvalPolicy: 'never',
+        sandboxPolicy: { type: 'dangerFullAccess' },
+      });
+
+      await active.completionPromise;
+    } catch (err) {
+      this.finishActiveRequest({ type: 'error', message: err.message || 'Codex app-server interaction failed.' });
+      this.destroy('warm-interaction-error');
+    }
+  }
+
+  destroy(reason = 'shutdown') {
+    if (this.closed) return;
+    this.closed = true;
+    clearSharedCodexWarmWorker(this);
+    this.clearIdleTimer();
+    if (this.fingerprintRefreshTimer) {
+      clearTimeout(this.fingerprintRefreshTimer);
+      this.fingerprintRefreshTimer = null;
+    }
+    if (!this.child.killed && this.child.exitCode == null) {
+      try {
+        this.child.kill('SIGTERM');
+      } catch {
+        return;
+      }
+      this.forceKillTimer = setTimeout(() => {
+        if (!this.child.killed && this.child.exitCode == null) {
+          try {
+            this.child.kill('SIGKILL');
+          } catch {
+            // ignore
+          }
+        }
+      }, 1500);
+      this.forceKillTimer.unref?.();
+    }
+    if (reason && reason !== 'idle-timeout') {
+      console.warn(`[session-dashboard] Disposing warm Codex worker (${reason}) ${this.describeContext()}`);
+    }
+  }
+}
+
+async function streamCodexAppServerColdInteraction(res, req, options) {
   return new Promise((resolve) => {
     let finished = false;
     let clientDisconnected = false;
@@ -730,12 +1382,23 @@ async function streamCodexAppServerInteraction(res, req, options) {
 
     const sendRequest = (method, params, timeoutMs = CODEX_REQUEST_TIMEOUT_MS) => {
       const id = String(nextRequestId++);
+      const startedAt = Date.now();
       return new Promise((resolveRequest, rejectRequest) => {
         const timer = setTimeout(() => {
           pendingRequests.delete(id);
+          console.warn(
+            `[session-dashboard] Codex ${method} timed out after ${timeoutMs}ms ` +
+            `(cwd=${options.cwd}, thread=${options.threadTarget?.rawSessionId || ''})`,
+          );
           rejectRequest(new Error(`Timed out waiting for ${method} response.`));
         }, timeoutMs);
-        pendingRequests.set(id, { resolve: resolveRequest, reject: rejectRequest, timer, method });
+        pendingRequests.set(id, {
+          resolve: resolveRequest,
+          reject: rejectRequest,
+          timer,
+          method,
+          startedAt,
+        });
         try {
           writeMessage({ id, method, params });
         } catch (err) {
@@ -837,26 +1500,17 @@ async function streamCodexAppServerInteraction(res, req, options) {
       }
 
       if (method === 'item/started' && params?.item?.type === 'commandExecution') {
-        sendEvent(res, {
-          type: 'tool_event',
-          message: `shell_command\n\`\`\`bash\n${formatCommandForDisplay(params.item.command)}\n\`\`\``,
-        });
+        sendEvent(res, buildCodexCommandStartEvent(params.item));
         return;
       }
 
       if (method === 'item/completed' && params?.item?.type === 'commandExecution') {
-        sendEvent(res, {
-          type: 'tool_result',
-          message: formatAppServerCommandResult(params.item),
-        });
+        sendEvent(res, buildCodexCommandResultEvent(params.item, formatAppServerCommandResult));
         return;
       }
 
       if (method === 'item/completed' && params?.item?.type === 'fileChange') {
-        sendEvent(res, {
-          type: 'tool_event',
-          message: `apply_patch\n${formatAppServerFileChanges(params.item)}`,
-        });
+        sendEvent(res, buildCodexFileChangeEvent(params.item, formatAppServerFileChanges));
         return;
       }
 
@@ -918,6 +1572,13 @@ async function streamCodexAppServerInteraction(res, req, options) {
         if (!pending) return;
         clearTimeout(pending.timer);
         pendingRequests.delete(id);
+        const elapsedMs = Date.now() - (pending.startedAt || Date.now());
+        if (elapsedMs >= 5000) {
+          console.warn(
+            `[session-dashboard] Codex ${pending.method} completed in ${elapsedMs}ms ` +
+            `(cwd=${options.cwd}, thread=${options.threadTarget?.rawSessionId || ''})`,
+          );
+        }
         if (message.error) {
           pending.reject(new Error(message.error.message || `${pending.method} failed.`));
           return;
@@ -1005,6 +1666,15 @@ async function streamCodexAppServerInteraction(res, req, options) {
         let thread = null;
         let lastResumeError = null;
         for (let attempt = 1; attempt <= CODEX_THREAD_RESUME_MAX_ATTEMPTS; attempt += 1) {
+          const resumeStartedAt = Date.now();
+          const resumeHeartbeat = setInterval(() => {
+            const elapsedSec = Math.floor((Date.now() - resumeStartedAt) / 1000);
+            sendEvent(res, {
+              type: 'status',
+              message: `Still waiting for Codex session resume (${elapsedSec}s)...`,
+            });
+          }, CODEX_THREAD_RESUME_STATUS_INTERVAL_MS);
+          resumeHeartbeat.unref?.();
           sendEvent(res, {
             type: 'status',
             message: attempt === 1
@@ -1030,6 +1700,8 @@ async function streamCodexAppServerInteraction(res, req, options) {
               message: `${err.message || 'Codex resume failed.'} Retrying...`,
             });
             await delay(CODEX_THREAD_RESUME_RETRY_DELAY_MS);
+          } finally {
+            clearInterval(resumeHeartbeat);
           }
         }
         if (!thread && lastResumeError) {
@@ -1059,6 +1731,52 @@ async function streamCodexAppServerInteraction(res, req, options) {
       finish({ type: 'error', message: err.message || 'Codex app-server interaction failed.' });
       stopChild();
     });
+  });
+}
+
+async function streamCodexAppServerInteraction(res, req, options) {
+  if (!canUseWarmCodexWorker(options)) {
+    return streamCodexAppServerColdInteraction(res, req, options);
+  }
+
+  const transcriptFingerprint = await resolveCodexTranscriptFingerprint(options);
+  const reuseKey = buildCodexWarmReuseKey(options);
+  const currentWorker = sharedCodexWarmWorker;
+
+  if (currentWorker) {
+    const reuseDecision = currentWorker.canReuse(reuseKey, transcriptFingerprint);
+    if (!reuseDecision.ok) {
+      if (reuseDecision.reason !== 'busy') {
+        console.warn(
+          `[session-dashboard] Warm Codex worker invalidated (${reuseDecision.reason}) ` +
+          `(cwd=${options.cwd}, thread=${options.threadTarget?.rawSessionId || ''})`,
+        );
+        currentWorker.destroy(reuseDecision.reason);
+      } else {
+        sendEvent(res, {
+          type: 'status',
+          message: 'Warm Codex worker is busy; falling back to a fresh session resume.',
+        });
+        return streamCodexAppServerColdInteraction(res, req, options);
+      }
+    }
+  }
+
+  if (!sharedCodexWarmWorker) {
+    sharedCodexWarmWorker = new CodexWarmWorker({
+      command: options.command,
+      cwd: options.cwd,
+      env: options.env || {},
+      locator: options.locator,
+      config: options.config,
+      reuseKey,
+      transcriptFingerprint,
+    });
+  }
+
+  return sharedCodexWarmWorker.runInteraction(res, req, {
+    ...options,
+    transcriptFingerprint,
   });
 }
 
@@ -1313,6 +2031,8 @@ export async function handleInteractionRequest(req, res, { project, locator, con
         text,
         imageFiles,
         threadTarget,
+        locator,
+        config,
         env: {
           CODEX_INTERNAL_ORIGINATOR_OVERRIDE:
             process.env.CODEX_INTERNAL_ORIGINATOR_OVERRIDE || DEFAULT_CODEX_ORIGINATOR,

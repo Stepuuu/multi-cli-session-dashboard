@@ -4,7 +4,6 @@ import os from 'node:os';
 import path from 'node:path';
 import fs from 'node:fs/promises';
 import { spawn } from 'node:child_process';
-
 import { fileURLToPath } from 'node:url';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -410,6 +409,863 @@ test('keeps forked Codex sessions distinct when parent session metadata is embed
   });
 });
 
+test('filters Codex subagent sessions while keeping parent sessions visible', async () => {
+  await withPreservedCache(async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'session-dashboard-codex-subagent-'));
+    const claudeProjectsDir = path.join(root, 'claude-projects');
+    const codexSessionsDir = path.join(root, 'codex-sessions');
+    const copilotSessionStateDir = path.join(root, 'copilot');
+    const projectPath = '/tmp/project';
+
+    await mkdirp(claudeProjectsDir);
+    await mkdirp(codexSessionsDir);
+    await mkdirp(copilotSessionStateDir);
+
+    const parentFile = path.join(codexSessionsDir, '2026', '04', '16', 'parent.jsonl');
+    const childFile = path.join(codexSessionsDir, '2026', '04', '16', 'child.jsonl');
+
+    await writeJsonl(parentFile, [
+      {
+        timestamp: '2026-04-16T08:00:00.000Z',
+        type: 'session_meta',
+        payload: {
+          id: 'parent-session',
+          cwd: projectPath,
+          timestamp: '2026-04-16T08:00:00.000Z',
+          model: 'gpt-5.4',
+          source: 'cli',
+        },
+      },
+      {
+        timestamp: '2026-04-16T08:00:01.000Z',
+        type: 'event_msg',
+        payload: {
+          type: 'user_message',
+          message: 'parent prompt',
+        },
+      },
+      {
+        timestamp: '2026-04-16T08:00:02.000Z',
+        type: 'response_item',
+        payload: { type: 'message', role: 'assistant', content: [] },
+      },
+    ]);
+
+    await writeJsonl(childFile, [
+      {
+        timestamp: '2026-04-16T08:01:00.000Z',
+        type: 'session_meta',
+        payload: {
+          id: 'child-session',
+          cwd: projectPath,
+          timestamp: '2026-04-16T08:01:00.000Z',
+          model: 'gpt-5.4',
+          source: {
+            subagent: {
+              thread_spawn: {
+                parent_thread_id: 'parent-session',
+                depth: 1,
+                agent_role: 'explorer',
+                agent_nickname: 'Curie',
+              },
+            },
+          },
+          agent_role: 'explorer',
+          agent_nickname: 'Curie',
+        },
+      },
+      {
+        timestamp: '2026-04-16T08:01:01.000Z',
+        type: 'event_msg',
+        payload: {
+          type: 'user_message',
+          message: 'child prompt',
+        },
+      },
+      {
+        timestamp: '2026-04-16T08:01:02.000Z',
+        type: 'response_item',
+        payload: { type: 'message', role: 'assistant', content: [] },
+      },
+    ]);
+
+    await setMtime(parentFile, '2026-04-16T08:00:02.000Z');
+    await setMtime(childFile, '2026-04-16T08:01:02.000Z');
+
+    const server = await startServer({ claudeProjectsDir, codexSessionsDir, copilotSessionStateDir });
+    try {
+      const projects = await getJson(server.port, '/api/projects');
+      assert.equal(projects.length, 1);
+
+      const sessions = await getJson(server.port, `/api/sessions/${projects[0].dirName}`);
+      assert.deepEqual(
+        sessions.map((session) => session.rawSessionId),
+        ['parent-session'],
+      );
+
+      const digest = await getJson(server.port, `/api/sessions-digest/${projects[0].dirName}`);
+      assert.deepEqual(
+        digest.map((session) => session.rawSessionId),
+        ['parent-session'],
+      );
+    } finally {
+      await server.stop();
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
+});
+
+test('merges hidden Codex subagent transcripts into the parent message timeline', async () => {
+  await withPreservedCache(async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'session-dashboard-codex-subagent-merge-'));
+    const claudeProjectsDir = path.join(root, 'claude-projects');
+    const codexSessionsDir = path.join(root, 'codex-sessions');
+    const copilotSessionStateDir = path.join(root, 'copilot');
+    const projectPath = '/tmp/project';
+
+    await mkdirp(claudeProjectsDir);
+    await mkdirp(codexSessionsDir);
+    await mkdirp(copilotSessionStateDir);
+
+    const parentFile = path.join(codexSessionsDir, '2026', '04', '16', 'parent.jsonl');
+    const childFile = path.join(codexSessionsDir, '2026', '04', '16', 'child.jsonl');
+
+    await writeJsonl(parentFile, [
+      {
+        timestamp: '2026-04-16T10:00:00.000Z',
+        type: 'session_meta',
+        payload: {
+          id: 'parent-session',
+          cwd: projectPath,
+          timestamp: '2026-04-16T10:00:00.000Z',
+          model: 'gpt-5.4',
+        },
+      },
+      {
+        timestamp: '2026-04-16T10:00:01.000Z',
+        type: 'event_msg',
+        payload: {
+          type: 'user_message',
+          message: 'parent prompt',
+        },
+      },
+      {
+        timestamp: '2026-04-16T10:00:02.000Z',
+        type: 'event_msg',
+        payload: {
+          type: 'agent_message',
+          phase: 'commentary',
+          message: 'Tracing the code path first.',
+        },
+      },
+      {
+        timestamp: '2026-04-16T10:00:03.000Z',
+        type: 'response_item',
+        payload: {
+          type: 'function_call',
+          name: 'exec_command',
+          arguments: '{"cmd":"pwd"}',
+          call_id: 'call-parent-1',
+        },
+      },
+      {
+        timestamp: '2026-04-16T10:00:04.000Z',
+        type: 'response_item',
+        payload: {
+          type: 'function_call_output',
+          call_id: 'call-parent-1',
+          output: '/tmp/project',
+        },
+      },
+      {
+        timestamp: '2026-04-16T10:00:05.000Z',
+        type: 'response_item',
+        payload: {
+          type: 'message',
+          role: 'assistant',
+          content: [{ type: 'output_text', text: 'parent answer' }],
+        },
+      },
+    ]);
+
+    await writeJsonl(childFile, [
+      {
+        timestamp: '2026-04-16T10:00:02.500Z',
+        type: 'session_meta',
+        payload: {
+          id: 'child-session',
+          cwd: projectPath,
+          timestamp: '2026-04-16T10:00:02.500Z',
+          model: 'gpt-5.4',
+          source: {
+            subagent: {
+              thread_spawn: {
+                parent_thread_id: 'parent-session',
+                depth: 1,
+                agent_role: 'explorer',
+                agent_nickname: 'Curie',
+              },
+            },
+          },
+          agent_role: 'explorer',
+          agent_nickname: 'Curie',
+        },
+      },
+      {
+        timestamp: '2026-04-16T10:00:02.600Z',
+        type: 'event_msg',
+        payload: {
+          type: 'task_started',
+          turn_id: 'turn-child-1',
+          model_context_window: 258400,
+        },
+      },
+      {
+        timestamp: '2026-04-16T10:00:02.700Z',
+        type: 'event_msg',
+        payload: {
+          type: 'user_message',
+          message: 'inspect files',
+        },
+      },
+      {
+        timestamp: '2026-04-16T10:00:02.800Z',
+        type: 'event_msg',
+        payload: {
+          type: 'agent_message',
+          phase: 'commentary',
+          message: 'Checking files now.',
+        },
+      },
+      {
+        timestamp: '2026-04-16T10:00:02.900Z',
+        type: 'response_item',
+        payload: {
+          type: 'function_call',
+          name: 'exec_command',
+          arguments: '{"cmd":"ls -la"}',
+          call_id: 'call-child-1',
+        },
+      },
+      {
+        timestamp: '2026-04-16T10:00:03.000Z',
+        type: 'response_item',
+        payload: {
+          type: 'function_call_output',
+          call_id: 'call-child-1',
+          output: 'total 0',
+        },
+      },
+      {
+        timestamp: '2026-04-16T10:00:03.200Z',
+        type: 'event_msg',
+        payload: {
+          type: 'task_complete',
+          turn_id: 'turn-child-1',
+          completed_at: 1776333603,
+          duration_ms: 600,
+        },
+      },
+    ]);
+
+    await setMtime(parentFile, '2026-04-16T10:00:05.000Z');
+    await setMtime(childFile, '2026-04-16T10:00:03.200Z');
+
+    const server = await startServer({ claudeProjectsDir, codexSessionsDir, copilotSessionStateDir });
+    try {
+      const projects = await getJson(server.port, '/api/projects');
+      const sessions = await getJson(server.port, `/api/sessions/${projects[0].dirName}`);
+      assert.deepEqual(sessions.map((session) => session.rawSessionId), ['parent-session']);
+
+      const merged = await getJson(
+        server.port,
+        `/api/messages/${projects[0].dirName}/${encodeURIComponent(sessions[0].sessionId)}?offset=0&limit=50&direction=newest`,
+      );
+      const subagentGroup = merged.messages.find((message) => message.type === 'subagent_group');
+      assert.ok(subagentGroup, 'expected merged subagent group message');
+      assert.equal(subagentGroup.subagent.nickname, 'Curie');
+      assert.equal(subagentGroup.subagent.role, 'explorer');
+      assert.equal(subagentGroup.subagent.parentThreadId, 'parent-session');
+      assert.equal(Array.isArray(subagentGroup.messages), true);
+      assert.equal(subagentGroup.messages.some((message) => message.type === 'assistant'), true);
+      assert.equal(
+        subagentGroup.messages.some((message) => message.type === 'tool_result' || message.type === 'tool_activity'),
+        true,
+      );
+
+      const subagentGroups = await getJson(
+        server.port,
+        `/api/subagent-groups/${projects[0].dirName}/${encodeURIComponent(sessions[0].sessionId)}?tail=4&fresh=1`,
+      );
+      assert.equal(subagentGroups.total, 1);
+      assert.equal(subagentGroups.groups[0].subagent.rawSessionId, 'child-session');
+      assert.equal(subagentGroups.groups[0].messages.length <= 4, true);
+    } finally {
+      await server.stop();
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
+});
+
+test('dedupes Codex commentary, status, and deferred tool activity messages', async () => {
+  await withPreservedCache(async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'session-dashboard-codex-message-dedupe-'));
+    const claudeProjectsDir = path.join(root, 'claude-projects');
+    const codexSessionsDir = path.join(root, 'codex-sessions');
+    const copilotSessionStateDir = path.join(root, 'copilot');
+    const projectPath = '/tmp/project';
+    const sessionFile = path.join(codexSessionsDir, '2026', '04', '17', 'dedupe.jsonl');
+
+    await mkdirp(claudeProjectsDir);
+    await mkdirp(codexSessionsDir);
+    await mkdirp(copilotSessionStateDir);
+
+    await writeJsonl(sessionFile, [
+      {
+        timestamp: '2026-04-17T08:00:00.000Z',
+        type: 'session_meta',
+        payload: {
+          id: 'dedupe-session',
+          cwd: projectPath,
+          timestamp: '2026-04-17T08:00:00.000Z',
+          model: 'gpt-5.4',
+        },
+      },
+      {
+        timestamp: '2026-04-17T08:00:00.100Z',
+        type: 'event_msg',
+        payload: {
+          type: 'task_started',
+          model_context_window: 258400,
+        },
+      },
+      {
+        timestamp: '2026-04-17T08:00:00.200Z',
+        type: 'event_msg',
+        payload: {
+          type: 'user_message',
+          message: 'Please inspect and patch the file.',
+        },
+      },
+      {
+        timestamp: '2026-04-17T08:00:00.300Z',
+        type: 'event_msg',
+        payload: {
+          type: 'agent_message',
+          phase: 'commentary',
+          message: 'Inspecting the file first.',
+        },
+      },
+      {
+        timestamp: '2026-04-17T08:00:00.400Z',
+        type: 'response_item',
+        payload: {
+          type: 'message',
+          role: 'assistant',
+          content: [{ type: 'output_text', text: 'Inspecting the file first.' }],
+        },
+      },
+      {
+        timestamp: '2026-04-17T08:00:00.500Z',
+        type: 'response_item',
+        payload: {
+          type: 'function_call',
+          name: 'exec_command',
+          arguments: '{"cmd":"pwd"}',
+          call_id: 'call-exec',
+        },
+      },
+      {
+        timestamp: '2026-04-17T08:00:00.550Z',
+        type: 'response_item',
+        payload: {
+          type: 'function_call_output',
+          call_id: 'call-exec',
+          output: 'Chunk ID: abc123\nWall time: 0.1 seconds\nProcess exited with code 0\nOutput:\n/tmp/project\n',
+        },
+      },
+      {
+        timestamp: '2026-04-17T08:00:00.600Z',
+        type: 'event_msg',
+        payload: {
+          type: 'exec_command_end',
+          call_id: 'call-exec',
+          command: ['pwd'],
+          parsed_cmd: [{ type: 'unknown', cmd: 'pwd' }],
+          aggregated_output: '/tmp/project\n',
+          exit_code: 0,
+          status: 'completed',
+        },
+      },
+      {
+        timestamp: '2026-04-17T08:00:00.700Z',
+        type: 'event_msg',
+        payload: {
+          type: 'token_count',
+          info: {
+            model_context_window: 258400,
+            last_token_usage: {
+              input_tokens: 2048,
+              cached_input_tokens: 1024,
+              output_tokens: 128,
+              total_tokens: 2176,
+            },
+          },
+        },
+      },
+      {
+        timestamp: '2026-04-17T08:00:03.000Z',
+        type: 'response_item',
+        payload: {
+          type: 'custom_tool_call',
+          name: 'apply_patch',
+          call_id: 'call-patch',
+          input: 'apply_patch\n*** Begin Patch\n*** Update File: foo.txt\n@@\n-old\n+new\n*** End Patch\n',
+        },
+      },
+      {
+        timestamp: '2026-04-17T08:00:03.050Z',
+        type: 'response_item',
+        payload: {
+          type: 'custom_tool_call_output',
+          call_id: 'call-patch',
+          output: '{"output":"Success. Updated the following files:\\nM foo.txt\\n"}',
+        },
+      },
+      {
+        timestamp: '2026-04-17T08:00:03.100Z',
+        type: 'event_msg',
+        payload: {
+          type: 'patch_apply_end',
+          call_id: 'call-patch',
+          success: true,
+          stdout: 'Success. Updated the following files:\nM foo.txt\n',
+          stderr: '',
+          changes: {
+            'foo.txt': {
+              type: 'update',
+              unified_diff: '@@\n-old\n+new\n',
+            },
+          },
+        },
+      },
+      {
+        timestamp: '2026-04-17T08:00:03.150Z',
+        type: 'event_msg',
+        payload: {
+          type: 'token_count',
+          info: {
+            model_context_window: 258400,
+            last_token_usage: {
+              input_tokens: 2048,
+              cached_input_tokens: 1024,
+              output_tokens: 128,
+              total_tokens: 2176,
+            },
+          },
+        },
+      },
+      {
+        timestamp: '2026-04-17T08:00:03.300Z',
+        type: 'response_item',
+        payload: {
+          type: 'message',
+          role: 'assistant',
+          content: [{ type: 'output_text', text: 'Done.' }],
+        },
+      },
+    ]);
+
+    await setMtime(sessionFile, '2026-04-17T08:00:03.300Z');
+
+    const server = await startServer({ claudeProjectsDir, codexSessionsDir, copilotSessionStateDir });
+    try {
+      const projects = await getJson(server.port, '/api/projects');
+      const sessions = await getJson(server.port, `/api/sessions/${projects[0].dirName}`);
+      const payload = await getJson(
+        server.port,
+        `/api/messages/${projects[0].dirName}/${encodeURIComponent(sessions[0].sessionId)}?offset=0&limit=50&direction=oldest&fresh=1`,
+      );
+
+      const duplicateAssistants = payload.messages.filter(
+        (message) => message.type === 'assistant'
+          && message.content?.[0]?.text === 'Inspecting the file first.',
+      );
+      assert.equal(duplicateAssistants.length, 1);
+      assert.equal(duplicateAssistants[0].roleLabel, 'CODEX');
+
+      const duplicateStatuses = payload.messages.filter(
+        (message) => message.type === 'status'
+          && message.content === 'Context 2176/258400 · Input 2048 · Cached 1024 · Output 128',
+      );
+      assert.equal(duplicateStatuses.length, 1);
+
+      const execActivities = payload.messages.filter((message) => message.type === 'tool_activity' && message.callId === 'call-exec');
+      assert.equal(execActivities.length, 1);
+      assert.equal(execActivities[0].command, 'pwd');
+      assert.equal(execActivities[0].exitCode, 0);
+      assert.equal(execActivities[0].output, '/tmp/project\n');
+
+      const patchActivities = payload.messages.filter((message) => message.type === 'tool_activity' && message.callId === 'call-patch');
+      assert.equal(patchActivities.length, 1);
+      assert.equal(Array.isArray(patchActivities[0].changes), true);
+      assert.equal(patchActivities[0].changes.length, 1);
+      assert.match(patchActivities[0].diffSource, /\*\*\* Begin Patch/);
+    } finally {
+      await server.stop();
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
+});
+
+test('preserves Claude tool metadata in parsed message payloads', async () => {
+  await withPreservedCache(async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'session-dashboard-claude-tools-'));
+    const claudeProjectsDir = path.join(root, 'claude-projects');
+    const codexSessionsDir = path.join(root, 'codex-sessions');
+    const copilotSessionStateDir = path.join(root, 'copilot');
+    const projectDir = path.join(claudeProjectsDir, 'tmp-project');
+
+    await mkdirp(projectDir);
+    await mkdirp(codexSessionsDir);
+    await mkdirp(copilotSessionStateDir);
+
+    await writeJsonl(path.join(projectDir, 'real-session.jsonl'), [
+      {
+        type: 'user',
+        message: { content: [{ type: 'text', text: 'run the command' }] },
+        gitBranch: 'main',
+        timestamp: '2026-04-11T00:00:00.000Z',
+      },
+      {
+        type: 'assistant',
+        message: {
+          model: 'claude-opus-4-6',
+          content: [
+            {
+              type: 'tool_use',
+              id: 'tool-1',
+              name: 'Bash',
+              input: {
+                command: 'echo hi',
+                description: 'Say hi',
+              },
+            },
+          ],
+        },
+        timestamp: '2026-04-11T00:00:01.000Z',
+      },
+      {
+        type: 'user',
+        message: {
+          role: 'user',
+          content: [
+            {
+              type: 'tool_result',
+              tool_use_id: 'tool-1',
+              content: 'hi',
+              is_error: false,
+            },
+          ],
+        },
+        toolUseResult: {
+          stdout: 'hi',
+          stderr: '',
+          interrupted: false,
+          isImage: false,
+          noOutputExpected: false,
+        },
+        timestamp: '2026-04-11T00:00:02.000Z',
+      },
+    ]);
+
+    const server = await startServer({ claudeProjectsDir, codexSessionsDir, copilotSessionStateDir });
+    try {
+      const projects = await getJson(server.port, '/api/projects');
+      const sessions = await getJson(server.port, `/api/sessions/${projects[0].dirName}`);
+      const payload = await getJson(
+        server.port,
+        `/api/messages/${projects[0].dirName}/${encodeURIComponent(sessions[0].sessionId)}?offset=0&limit=50&direction=newest`,
+      );
+      const assistant = payload.messages.find((message) => message.type === 'assistant');
+      const toolResult = payload.messages.find((message) => message.type === 'tool_result');
+
+      assert.equal(assistant.content[0].type, 'tool_use');
+      assert.equal(assistant.content[0].summary, 'echo hi');
+      assert.equal(assistant.content[0].input.command, 'echo hi');
+
+      assert.equal(toolResult.content[0].type, 'tool_result');
+      assert.equal(toolResult.content[0].summary, 'stdout=hi · stderr= · interrupted=false');
+      assert.equal(toolResult.content[0].structured.stdout, 'hi');
+      assert.equal(toolResult.content[0].isError, false);
+    } finally {
+      await server.stop();
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
+});
+
+test('rescans legacy cached Codex metadata before deciding whether a session is visible', async () => {
+  await withPreservedCache(async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'session-dashboard-codex-legacy-cache-'));
+    const claudeProjectsDir = path.join(root, 'claude-projects');
+    const codexSessionsDir = path.join(root, 'codex-sessions');
+    const copilotSessionStateDir = path.join(root, 'copilot');
+    const projectPath = '/tmp/project';
+
+    await mkdirp(claudeProjectsDir);
+    await mkdirp(codexSessionsDir);
+    await mkdirp(copilotSessionStateDir);
+
+    const parentFile = path.join(codexSessionsDir, '2026', '04', '16', 'parent.jsonl');
+    const childFile = path.join(codexSessionsDir, '2026', '04', '16', 'child.jsonl');
+
+    await writeJsonl(parentFile, [
+      {
+        timestamp: '2026-04-16T09:00:00.000Z',
+        type: 'session_meta',
+        payload: {
+          id: 'parent-session',
+          cwd: projectPath,
+          timestamp: '2026-04-16T09:00:00.000Z',
+          model: 'gpt-5.4',
+          source: 'cli',
+        },
+      },
+      {
+        timestamp: '2026-04-16T09:00:01.000Z',
+        type: 'event_msg',
+        payload: {
+          type: 'user_message',
+          message: 'parent prompt',
+        },
+      },
+    ]);
+
+    await writeJsonl(childFile, [
+      {
+        timestamp: '2026-04-16T09:01:00.000Z',
+        type: 'session_meta',
+        payload: {
+          id: 'child-session',
+          cwd: projectPath,
+          timestamp: '2026-04-16T09:01:00.000Z',
+          model: 'gpt-5.4',
+          source: {
+            subagent: {
+              thread_spawn: {
+                parent_thread_id: 'parent-session',
+                depth: 1,
+                agent_role: 'explorer',
+                agent_nickname: 'Kierkegaard',
+              },
+            },
+          },
+        },
+      },
+      {
+        timestamp: '2026-04-16T09:01:01.000Z',
+        type: 'event_msg',
+        payload: {
+          type: 'user_message',
+          message: 'child prompt',
+        },
+      },
+    ]);
+
+    await setMtime(parentFile, '2026-04-16T09:00:01.000Z');
+    await setMtime(childFile, '2026-04-16T09:01:01.000Z');
+
+    const childStat = await fs.stat(childFile);
+    const childCacheKey = `codex:${childFile}`;
+    const childFingerprint = `${Math.floor(childStat.mtimeMs)}:${childStat.size}`;
+
+    await fs.mkdir(path.dirname(CACHE_FILE), { recursive: true });
+    await fs.writeFile(
+      CACHE_FILE,
+      JSON.stringify({
+        savedAt: new Date().toISOString(),
+        entries: {
+          [childCacheKey]: {
+            fingerprint: childFingerprint,
+            data: {
+              source: 'codex',
+              projectPath,
+              rawSessionId: 'child-session',
+              firstPrompt: 'child prompt',
+              messageCount: 1,
+              created: '2026-04-16T09:01:00.000Z',
+              modified: '2026-04-16T09:01:01.000Z',
+              gitBranch: '',
+              model: 'gpt-5.4',
+              fileSizeBytes: childStat.size,
+            },
+          },
+        },
+      }, null, 2) + '\n',
+      'utf8',
+    );
+
+    const server = await startServer({ claudeProjectsDir, codexSessionsDir, copilotSessionStateDir });
+    try {
+      const projects = await getJson(server.port, '/api/projects');
+      assert.equal(projects.length, 1);
+
+      const sessions = await getJson(server.port, `/api/sessions/${projects[0].dirName}`);
+      assert.deepEqual(
+        sessions.map((session) => session.rawSessionId),
+        ['parent-session'],
+      );
+    } finally {
+      await server.stop();
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
+});
+
+test('rescans cached hidden Codex subagent metadata to recover terminal status', async () => {
+  await withPreservedCache(async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'session-dashboard-codex-subagent-cache-refresh-'));
+    const claudeProjectsDir = path.join(root, 'claude-projects');
+    const codexSessionsDir = path.join(root, 'codex-sessions');
+    const copilotSessionStateDir = path.join(root, 'copilot');
+    const projectPath = '/tmp/project';
+
+    await mkdirp(claudeProjectsDir);
+    await mkdirp(codexSessionsDir);
+    await mkdirp(copilotSessionStateDir);
+
+    const parentFile = path.join(codexSessionsDir, '2026', '04', '17', 'parent.jsonl');
+    const childFile = path.join(codexSessionsDir, '2026', '04', '17', 'child.jsonl');
+
+    await writeJsonl(parentFile, [
+      {
+        timestamp: '2026-04-17T09:00:00.000Z',
+        type: 'session_meta',
+        payload: {
+          id: 'parent-session',
+          cwd: projectPath,
+          timestamp: '2026-04-17T09:00:00.000Z',
+          model: 'gpt-5.4',
+        },
+      },
+      {
+        timestamp: '2026-04-17T09:00:01.000Z',
+        type: 'event_msg',
+        payload: {
+          type: 'user_message',
+          message: 'parent prompt',
+        },
+      },
+    ]);
+
+    await writeJsonl(childFile, [
+      {
+        timestamp: '2026-04-17T09:01:00.000Z',
+        type: 'session_meta',
+        payload: {
+          id: 'child-session',
+          cwd: projectPath,
+          timestamp: '2026-04-17T09:01:00.000Z',
+          model: 'gpt-5.4',
+          source: {
+            subagent: {
+              thread_spawn: {
+                parent_thread_id: 'parent-session',
+                depth: 1,
+                agent_role: 'explorer',
+                agent_nickname: 'Aristotle',
+              },
+            },
+          },
+          agent_role: 'explorer',
+          agent_nickname: 'Aristotle',
+        },
+      },
+      {
+        timestamp: '2026-04-17T09:01:01.000Z',
+        type: 'event_msg',
+        payload: {
+          type: 'user_message',
+          message: 'child prompt',
+        },
+      },
+      {
+        timestamp: '2026-04-17T09:01:05.000Z',
+        type: 'event_msg',
+        payload: {
+          type: 'task_complete',
+          completed_at: 1776416465,
+          duration_ms: 4000,
+        },
+      },
+    ]);
+
+    await setMtime(parentFile, '2026-04-17T09:00:01.000Z');
+    await setMtime(childFile, '2026-04-17T09:01:05.000Z');
+
+    const childStat = await fs.stat(childFile);
+    const childCacheKey = `codex:${childFile}`;
+    const childFingerprint = `${Math.floor(childStat.mtimeMs)}:${childStat.size}`;
+
+    await fs.mkdir(path.dirname(CACHE_FILE), { recursive: true });
+    await fs.writeFile(
+      CACHE_FILE,
+      JSON.stringify({
+        savedAt: new Date().toISOString(),
+        entries: {
+          [childCacheKey]: {
+            fingerprint: childFingerprint,
+            data: {
+              source: 'codex',
+              projectPath,
+              rawSessionId: 'child-session',
+              relativePath: path.relative(codexSessionsDir, childFile),
+              isSubagentSession: true,
+              parentThreadId: 'parent-session',
+              agentRole: 'explorer',
+              agentNickname: 'Aristotle',
+              depth: 1,
+              firstPrompt: 'child prompt',
+              messageCount: 1,
+              created: '2026-04-17T09:01:00.000Z',
+              modified: '2026-04-17T09:01:05.000Z',
+              gitBranch: '',
+              model: 'gpt-5.4',
+              fileSizeBytes: childStat.size,
+            },
+          },
+        },
+      }, null, 2) + '\n',
+      'utf8',
+    );
+
+    const server = await startServer({ claudeProjectsDir, codexSessionsDir, copilotSessionStateDir });
+    try {
+      const projects = await getJson(server.port, '/api/projects');
+      assert.equal(projects.length, 1);
+
+      const sessions = await getJson(server.port, `/api/sessions/${projects[0].dirName}`);
+      assert.deepEqual(
+        sessions.map((session) => session.rawSessionId),
+        ['parent-session'],
+      );
+
+      const groups = await getJson(
+        server.port,
+        `/api/subagent-groups/${projects[0].dirName}/${encodeURIComponent(sessions[0].sessionId)}?tail=4&fresh=1`,
+      );
+      assert.equal(groups.total, 1);
+      assert.equal(groups.groups[0].subagent.status, 'completed');
+      assert.equal(groups.groups[0].subagent.durationMs, 4000);
+      assert.match(groups.groups[0].subagent.completedAt, /^2026-04-17T09:01:05/);
+    } finally {
+      await server.stop();
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
+});
+
 
 test('extracts Codex file size and context usage metadata', async () => {
   await withPreservedCache(async () => {
@@ -562,11 +1418,14 @@ test('serves newest Codex messages for large sessions', async () => {
       const response = await fetch(`http://127.0.0.1:${server.port}/api/messages/${projects[0].dirName}/${encodeURIComponent(sessions[0].sessionId)}?offset=0&limit=2&direction=newest`);
       assert.equal(response.status, 200);
       const payload = await response.json();
+      assert.equal(Array.isArray(payload.messages), true);
+      assert.equal(typeof payload.total, 'number');
       assert.equal(payload.messages.length, 2);
       assert.equal(payload.messages[0].type, 'user');
       assert.equal(payload.messages[0].content, 'tail-user-message');
       assert.equal(payload.messages[1].type, 'assistant');
       assert.equal(payload.messages[1].content[0].text, 'tail-assistant-message');
+      assert.equal(payload.total > payload.messages.length, true);
       assert.equal(payload.hasMore, true);
     } finally {
       await server.stop();
